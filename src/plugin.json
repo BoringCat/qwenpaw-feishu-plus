@@ -1,0 +1,16 @@
+{
+  "id": "feishu-plus",
+  "name": "Feishu Plus",
+  "version": "1.0.1",
+  "type": "channel",
+  "description": "飞书渠道增强：话题内审批卡片发送路径修复 + 话题内流式输出 + 命令消息跳过引用卡片内容获取。继承内置 FeishuChannel，仅覆写话题相关逻辑。",
+  "author": "boringcat",
+  "entry": {
+    "backend": "plugin.py"
+  },
+  "dependencies": ["lark-oapi"],
+  "qwenpaw_version": {
+    "min": "2.0.0",
+    "max": "2.2.0"
+  }
+}
