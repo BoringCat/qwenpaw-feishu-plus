@@ -4,7 +4,8 @@ QwenPaw 飞书渠道增强插件（channel plugin）。继承内置 `FeishuChann
 
 - **话题内审批卡片** —— tool-guard 工具审批卡片发送到话题内（而非会话根），按钮点击后 `/approval` 命令也回注到原话题；
 - **话题内流式输出** —— CardKit 流式卡片在话题内创建与更新，失败自动回退纯文本；
-- **命令消息跳过引用获取** —— 以 `/` 开头的消息不抓取被回复卡片的内容，避免 `[quoted interactive: ...]` 前缀导致命令匹配失效。
+- **命令消息跳过引用获取** —— 以 `/` 开头的消息不抓取被回复卡片的内容，避免 `[quoted interactive: ...]` 前缀导致命令匹配失效；
+- **interactive 卡片 Markdown 渲染** —— 收到（含被回复引用）的 interactive 卡片渲染为结构化 Markdown（标题、正文、表格、@人名），修复内置实现丢失 `div` 正文、压成单行的问题。
 
 此外提供**话题级会话聚合**：话题内的群消息按 `thread_id` 聚合 session，同一话题共享一个会话上下文。
 
@@ -55,13 +56,16 @@ src/
 ├── plugin.json       # 插件清单（id: feishu-plus, type: channel）
 ├── plugin.py         # 入口：注册渠道 + 声明配置字段
 ├── channel.py        # FeishuPlusChannel —— 话题级 session 聚合、
-│                     #   命令跳过引用、话题内流式卡片创建
+│                     #   命令跳过引用、引用卡片 Markdown 渲染、
+│                     #   话题内流式卡片创建
+├── card_markdown.py  # interactive 卡片 → Markdown 渲染器（纯逻辑）
 └── cards_override.py # 话题感知的 tool-guard 审批卡片 render + handle
 ```
 
 - **审批卡片**：复用上游 `tool_guard` 的无状态构造/解析函数，仅把「话题路由」收敛到本插件——render 时强制把 `feishu_thread_id` / `feishu_message_id` 写进按钮 `session_ctx`，handle 时读回并让 `/approval` 命令落回原话题。因此 site-packages 的 `tool_guard.py` / `context.py` 可保持上游版本。
 - **话题内流式**：CardKit 流式 = ① `card.create` 得 `card_id` → ② 发 interactive 消息引用 `card_id` → ③ `card_element.content` 流式更新。仅 ② 受话题影响，插件让它在话题内改走话题内回复；若飞书话题不支持 CardKit 卡片，创建失败返回 `None`，自动回退为纯文本回复，不影响功能。
 - **命令跳过引用**：父类会把被回复的 interactive 卡片正文前置成 `[quoted interactive: ...]`，使命令文本不再以 `/` 开头、前缀匹配失效；跳过获取意味着不发 Get Message 请求，引用内容对命令场景本就无意义。
+- **卡片 Markdown 渲染**：内置 `extract_interactive_text` 把卡片压成单行，且 CardKit v2 卡片 `div` 的正文在 `text.content` 键（不在其递归的 child keys 里）会整体丢失。插件改用自研渲染器（`card_markdown.py`）：标题 → `# 标题`、`div`/`markdown` 正文保留（`<text_tag>` 去壳、`<at id=..>` → @名字、`<img>` → [图片]，emoji 短代码保留原样）、原生 `table` → GFM 表格、`note` → `> ` 引用块、`hr`/`button` 忽略。v1 卡片（顶层 `elements` + `markdown` tag）与 v2 / CardKit（`body.elements`）均支持。被引用（回复）卡片以 `> ` Markdown 引用块前置到消息文本，直接收到的卡片消息同样渲染完整 Markdown；渲染失败自动回退父类行为。`@` 名字解析复用 `_get_user_name_by_open_id`（带缓存），应用无 contact 权限或解析失败时回退 `@open_id后4位`。
 
 ## 已知限制
 

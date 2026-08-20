@@ -1,9 +1,9 @@
 {
   "id": "feishu-plus",
   "name": "Feishu Plus",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "type": "channel",
-  "description": "飞书渠道增强：话题内审批卡片发送路径修复 + 话题内流式输出 + 命令消息跳过引用卡片内容获取。继承内置 FeishuChannel，仅覆写话题相关逻辑。",
+  "description": "飞书渠道增强：话题内审批卡片 + 话题内流式输出 + 命令消息跳过引用获取 + interactive 卡片结构化 Markdown 渲染（quoted 引用块 / 直接消息）。继承内置 FeishuChannel。",
   "author": "boringcat",
   "entry": {
     "backend": "plugin.py"

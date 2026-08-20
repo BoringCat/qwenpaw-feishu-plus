@@ -3,7 +3,7 @@
 
 channel key = ``feishu_plus``（独立 key，避免与内置 feishu 冲突而被
 registry 跳过）。全部收发 / WebSocket / CardKit / 媒体能力继承自父类，
-本类只做两件事：
+本类只做四件事：
 
 1. 覆盖 tool-guard 审批卡片的 render —— 话题内走 ``_reply_in_thread``
    + ``msg_type="interactive"``（见 cards_override）。
@@ -12,20 +12,36 @@ registry 跳过）。全部收发 / WebSocket / CardKit / 媒体能力继承自�
 3. 以 ``/`` 开头的消息（控制命令）跳过引用消息获取 —— 用户回复
    机器人卡片时输入命令，父类抓回引用的 interactive 卡片内容并前置
    ``[quoted interactive: ...]``，会让命令文本不再以 ``/`` 开头。
+4. interactive 卡片渲染为结构化 Markdown（见 card_markdown）——
+   父类 ``extract_interactive_text`` 会把卡片压成单行，且 CardKit v2
+   ``div`` 的正文（在 ``text.content`` 键）整体丢失；本类对直接收到的
+   interactive 消息与被引用（quoted）卡片都改为完整 Markdown 渲染，
+   quoted 时以 ``> `` 引用块前置。
 """
 from __future__ import annotations
 
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from qwenpaw.app.channels.feishu.channel import FeishuChannel
+from qwenpaw.app.channels.feishu.channel import FeishuChannel, _MSG_TYPE_LABEL
 from qwenpaw.app.channels.feishu.constants import FEISHU_STREAM_ELEMENT_ID
 from qwenpaw.app.channels.feishu.utils import short_session_id_from_full_id
 from qwenpaw.app.channels.renderer import ChannelDisplayConfig
 
+from .card_markdown import interactive_card_to_markdown, quote_lines
+
 logger = logging.getLogger(__name__)
+
+
+def _quote_block(text: str) -> str:
+    """把 Markdown 文本转为 markdown 引用块（每行 ``> `` 前缀）。
+
+    空行渲染为单独的 ``>`` 保持引用块连续；块尾补一个空行，使
+    ``text_parts`` 以 ``\\n`` join 后引用块与用户正文之间有空行分隔。
+    """
+    return quote_lines(text) + "\n"
 
 
 class FeishuPlusChannel(FeishuChannel):
@@ -149,7 +165,42 @@ class FeishuPlusChannel(FeishuChannel):
         return f"{self.channel}:{sender_id}"
 
     # ------------------------------------------------------------------
-    # _process_quoted_message —— 命令消息跳过引用内容获取
+    # _parse_message_content —— interactive 卡片 → 结构化 Markdown
+    # ------------------------------------------------------------------
+
+    async def _parse_message_content(  # type: ignore[override]
+        self,
+        msg_type: str,
+        content_raw: str,
+        message_id: str,
+    ) -> Tuple[Optional[str], List[str], List[Any]]:
+        """interactive 消息渲染为结构化 Markdown（其余类型透传父类）。
+
+        父类对 interactive 调 ``extract_interactive_text``：把卡片压成
+        单行，且 CardKit v2 ``div`` 正文在 ``text.content`` 键 —— 不在
+        递归的 child keys 里 —— 主体内容整体丢失。这里改用
+        ``interactive_card_to_markdown``（见 card_markdown）完整渲染，
+        直接收到的卡片消息与 quoted 路径（经
+        ``_process_quoted_message``）都受益。渲染失败（JSON 损坏等）
+        回退父类单行压平。
+        """
+        if msg_type == "interactive":
+            markdown = await interactive_card_to_markdown(
+                content_raw,
+                at_resolver=self._get_user_name_by_open_id,
+            )
+            if markdown:
+                # interactive 卡片无媒体 content_parts，([], []) 与
+                # 父类一致。
+                return markdown, [], []
+        return await super()._parse_message_content(
+            msg_type,
+            content_raw,
+            message_id,
+        )
+
+    # ------------------------------------------------------------------
+    # _process_quoted_message —— 命令跳过引用 + interactive 引用块
     # ------------------------------------------------------------------
 
     async def _process_quoted_message(  # type: ignore[override]
@@ -158,7 +209,8 @@ class FeishuPlusChannel(FeishuChannel):
         text_parts: List[str],
         content_parts: List[Any],
     ) -> None:
-        """以 ``/`` 开头的消息不获取引用（被回复）消息内容。
+        """处理被引用（回复）消息：interactive 卡片渲染为 ``> `` 引用块，
+        其余类型保持父类拼装；以 ``/`` 开头的消息跳过引用获取。
 
         父类 ``_on_message`` 在调用本方法前已把当前消息正文放在
         ``text_parts[0]``（mention key 已剥离），据此判断是否为命令。
@@ -167,6 +219,12 @@ class FeishuPlusChannel(FeishuChannel):
         ``[quoted interactive: ...]``，命令文本不再以 ``/`` 开头，
         command_registry 的前缀匹配随之失效。跳过意味着不发
         Get Message 请求，引用内容对命令场景本就无意义。
+
+        interactive 卡片经 ``_parse_message_content`` 覆写得到完整
+        Markdown，以 markdown 引用块（每行 ``> `` 前缀）前置，与用户
+        正文空行分隔。非 interactive 类型复刻父类拼装（单行
+        ``[quoted {label}: ...]`` + error hints + media content_parts），
+        fetch 只做一次，不再透传 super 导致二次 Get Message。
         """
         first = text_parts[0].strip() if text_parts else ""
         if first.startswith("/"):
@@ -175,11 +233,49 @@ class FeishuPlusChannel(FeishuChannel):
                 first[:30],
             )
             return
-        await super()._process_quoted_message(
-            parent_id,
-            text_parts,
-            content_parts,
+
+        result = await self._fetch_quoted_message_content(parent_id)
+        if not result:
+            return
+        quoted_msg_type, quoted_content = result
+        logger.info(
+            "feishu-plus quoted message: parent_id=%s type=%s",
+            parent_id[:20],
+            quoted_msg_type,
         )
+
+        (
+            main_text,
+            error_hints,
+            parsed_content,
+        ) = await self._parse_message_content(
+            quoted_msg_type,
+            quoted_content,
+            parent_id,
+        )
+
+        if quoted_msg_type == "interactive" and main_text:
+            text_parts[:0] = [_quote_block(main_text)]
+            return
+
+        # 非 interactive：父类拼装逻辑（label 单行 + hints + media）。
+        label = _MSG_TYPE_LABEL.get(quoted_msg_type, quoted_msg_type)
+        quoted_lines: List[str] = []
+        if main_text:
+            quoted_lines.append(f"[quoted {label}: {main_text}]")
+        else:
+            quoted_lines.append(f"[quoted {label}]")
+        for hint in error_hints:
+            quoted_lines.append(
+                (
+                    f"[quoted {hint[1:]}"
+                    if hint.startswith("[")
+                    else f"[quoted {hint}]"
+                ),
+            )
+        text_parts[:0] = quoted_lines
+
+        content_parts.extend(parsed_content)
 
     # ==================================================================
     # 话题内流式输出（实验性）

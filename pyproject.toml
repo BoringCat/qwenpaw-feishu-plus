@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+# 自动发现 tests/ 目录下的所有测试
+testpaths = ["tests"]
+# 项目根加入 sys.path，使 src.* 可作为 namespace package 导入
+pythonpath = ["."]
+# marker 注册（随新模块增加时在此补充）
+markers = [
+    "asyncio: 异步测试",
+]
+# 显示中文 test ID（而非 \uxxxx 转义）
+disable_test_id_escaping_and_forfeit_all_rights_to_community_support = true
+# 异步测试默认模式
+asyncio_default_fixture_loop_scope = "function"
+asyncio_mode = "auto"
