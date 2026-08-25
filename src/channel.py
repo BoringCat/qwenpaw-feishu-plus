@@ -17,13 +17,23 @@ registry 跳过）。全部收发 / WebSocket / CardKit / 媒体能力继承自�
    ``div`` 的正文（在 ``text.content`` 键）整体丢失；本类对直接收到的
    interactive 消息与被引用（quoted）卡片都改为完整 Markdown 渲染，
    quoted 时以 ``> `` 引用块前置。
+5. 正则触发规则（YAML 文件配置）—— 群消息正文命中任一正则时绕过
+   ``require_mention`` 的 @提及 检查；规则可携带 ``context``，命中时
+   追加到消息正文末尾一并发送给 AI（见 ``_load_trigger_yaml``）。
+6. 自动进话题 —— 正则触发且消息不在话题中时，向事件注入
+   ``thread_id = message_id``，父类话题管道（session 聚合 / 话题回复 /
+   流式卡片）全部自动复用（见 ``_on_message``）。
 """
 from __future__ import annotations
 
 import json
 import logging
+import re
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from qwenpaw.app.channels.feishu.channel import FeishuChannel, _MSG_TYPE_LABEL
 from qwenpaw.app.channels.feishu.constants import FEISHU_STREAM_ELEMENT_ID
@@ -33,6 +43,61 @@ from qwenpaw.app.channels.renderer import ChannelDisplayConfig
 from .card_markdown import interactive_card_to_markdown, quote_lines
 
 logger = logging.getLogger(__name__)
+
+# 正则触发命中标记：``_on_message`` wrapper 在调用父类前置位，父类
+# 末尾的 ``_check_group_mention`` 覆写读取。同一 asyncio task 内直接
+# ``await super()``，context 对子调用可见且无并发串扰。
+_TRIGGER_MATCHED: ContextVar[bool] = ContextVar(
+    "feishu_plus_trigger_matched",
+    default=False,
+)
+
+# 触发规则 YAML 的默认文件名（位于 workspace 根目录下）。
+_TRIGGER_YAML_DEFAULT_NAME = "feishu_plus_triggers.yaml"
+
+
+# ── 触发规则 YAML 的 pydantic 模型 ──
+#
+# ``_load_trigger_yaml`` 先用 ``yaml.safe_load`` 读文件，再用
+# ``TriggerRulesFile`` 校验结构。结构 / 类型错误（多余字段、非字符串
+# pattern、非列表 triggers 等）会整份置空 —— 配置错误应显式暴露，
+# 而不是静默丢弃某条规则；正则本身编译失败仍逐条跳过（字符串在
+# 结构上合法，只是正则非法），见 ``_load_trigger_yaml``。
+
+
+class TriggerRule(BaseModel):
+    """单条触发规则：正则 ``pattern``（必填）+ 可选 ``context``。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pattern: str
+    context: str = ""
+
+    @field_validator("pattern", mode="before")
+    @classmethod
+    def _normalize_pattern(cls, value: Any) -> Any:
+        """去首尾空白；去空后为空则报错（pattern 必填）。"""
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("pattern must not be empty")
+        return value
+
+    @field_validator("context", mode="before")
+    @classmethod
+    def _normalize_context(cls, value: Any) -> Any:
+        """context 去首尾空白；``null`` 视作空串（非字符串报类型错误）。"""
+        if value is None:
+            return ""
+        return value.strip() if isinstance(value, str) else value
+
+
+class TriggerRulesFile(BaseModel):
+    """触发规则 YAML 顶层结构：``triggers`` 规则列表。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    triggers: List[TriggerRule]
 
 
 def _quote_block(text: str) -> str:
@@ -77,6 +142,11 @@ class FeishuPlusChannel(FeishuChannel):
             "feishu-plus: tool_guard render+handle overridden (thread-aware)",
         )
 
+        # ── 正则触发规则（from_config 覆盖；见 _load_trigger_yaml） ──
+        self._trigger_rules: List[Tuple[re.Pattern, str]] = []
+        self._trigger_yaml_path: str = ""
+        self._auto_thread_on_trigger: bool = False
+
     # ------------------------------------------------------------------
     # from_config —— 插件频道的 config 是 SimpleNamespace（非 Pydantic）
     # ------------------------------------------------------------------
@@ -96,7 +166,7 @@ class FeishuPlusChannel(FeishuChannel):
         插件频道的 ``config`` 是 ``types.SimpleNamespace``，必须用
         ``getattr`` 安全读取（详见官方插件文档「示例 10」）。
         """
-        return cls(
+        channel = cls(
             process=process,
             enabled=bool(getattr(config, "enabled", False)),
             app_id=getattr(config, "app_id", "") or "",
@@ -128,6 +198,205 @@ class FeishuPlusChannel(FeishuChannel):
                 getattr(config, "access_control_group", False),
             ),
         )
+        # 父类 __init__ 签名固定，插件专属配置在此以属性注入。
+        channel._auto_thread_on_trigger = bool(
+            getattr(config, "auto_thread_on_trigger", False),
+        )
+        ws_dir = workspace_dir or Path.cwd()
+        custom_path = str(
+            getattr(config, "trigger_yaml_path", "") or "",
+        ).strip()
+        if custom_path:
+            yaml_path = Path(custom_path)
+            if not yaml_path.is_absolute():
+                yaml_path = ws_dir / yaml_path
+        else:
+            yaml_path = ws_dir / _TRIGGER_YAML_DEFAULT_NAME
+        channel._trigger_yaml_path = str(yaml_path)
+        channel._load_trigger_yaml(yaml_path)
+        return channel
+
+    # ------------------------------------------------------------------
+    # 正则触发规则 —— YAML 加载 / 匹配 / mention 绕过 / 自动进话题
+    # ------------------------------------------------------------------
+
+    def _load_trigger_yaml(self, path: Path) -> None:
+        """加载触发规则 YAML（顶层 ``triggers:`` 列表）。
+
+        文件结构由 ``TriggerRulesFile`` / ``TriggerRule`` 两个 pydantic
+        模型校验：``triggers`` 为规则列表，每条 ``pattern``（正则，
+        ``re.search`` 语义）为必填非空字符串、``context`` 可选字符串，
+        多余字段与类型错误整份置空。正则编译失败逐条跳过并告警，
+        不影响其余条目。文件不存在 / 解析失败 / 结构不符只记日志并
+        置空规则，不抛异常 —— 触发规则是增强能力，不应因配置问题
+        阻断渠道启动。
+        """
+        self._trigger_rules = []
+        if not path or not path.is_file():
+            if path is not None and str(path).endswith(
+                _TRIGGER_YAML_DEFAULT_NAME,
+            ):
+                logger.info(
+                    "feishu-plus trigger yaml not found (ok): %s", path,
+                )
+            else:
+                logger.warning(
+                    "feishu-plus trigger yaml not found: %s", path,
+                )
+            return
+        try:
+            import yaml
+
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            logger.warning(
+                "feishu-plus trigger yaml parse failed: %s",
+                path,
+                exc_info=True,
+            )
+            return
+        try:
+            rules_file = TriggerRulesFile.model_validate(data)
+        except ValidationError as exc:
+            logger.warning(
+                "feishu-plus trigger yaml invalid format: %s (%s)",
+                path,
+                exc,
+            )
+            return
+        for idx, rule in enumerate(rules_file.triggers):
+            try:
+                pattern = re.compile(rule.pattern)
+            except re.error as exc:
+                logger.warning(
+                    "feishu-plus trigger yaml: rule #%d invalid regex "
+                    "%r (%s), skipped",
+                    idx,
+                    rule.pattern,
+                    exc,
+                )
+                continue
+            self._trigger_rules.append((pattern, rule.context))
+        logger.info(
+            "feishu-plus trigger rules loaded: %d from %s",
+            len(self._trigger_rules),
+            path,
+        )
+
+    def _match_trigger(
+        self,
+        message: Any,
+    ) -> Tuple[bool, str]:
+        """群 text 消息正文匹配触发规则。
+
+        返回 ``(matched, context)``：第一条 ``pattern.search`` 命中的
+        规则的 context（未配置则为空串）；未命中 / 非群 / 非 text /
+        正文解析失败均返回 ``(False, "")``。仅匹配 text 类型 —— 正则
+        面向文本，富文本（post）与媒体消息结构各异，不猜。
+        """
+        if not self._trigger_rules:
+            return False, ""
+        if str(
+            getattr(message, "chat_type", "p2p") or "p2p",
+        ).strip() != "group":
+            return False, ""
+        if str(
+            getattr(message, "message_type", "") or "",
+        ).strip() != "text":
+            return False, ""
+        content_raw = getattr(message, "content", None) or ""
+        try:
+            text = str(
+                (json.loads(content_raw) or {}).get("text", "") or "",
+            )
+        except (ValueError, TypeError):
+            return False, ""
+        for pattern, context in self._trigger_rules:
+            if pattern.search(text):
+                return True, context
+        return False, ""
+
+    async def _on_message(  # type: ignore[override]
+        self,
+        data: Any,
+    ) -> None:
+        """正则触发包装：命中时注入话题 + 追加 context，再走父类。
+
+        命中后做三件事（全部通过改写 event 数据完成，父类流程无感知）：
+
+        1. ``auto_thread_on_trigger`` 开启且消息无 ``thread_id`` 时注入
+           ``thread_id = message_id`` —— 父类话题管道（session 按
+           thread 聚合、``_reply_in_thread`` 话题回复、流式卡片进话题）
+           全部自动复用；飞书话题根消息的 thread_id 即其自身
+           message_id，后续话题内消息携带相同值，会话天然连续。
+        2. 规则携带 ``context`` 时改写 ``content`` 的 text 字段，末尾
+           追加一行 —— 与 @触发 时正文直接可见的效果一致，quoted
+           引用块仍前置、slash 命令前缀判断不受末尾追加影响。
+        3. 置 ``_TRIGGER_MATCHED`` 供 ``_check_group_mention`` 覆写
+           读取（require_mention 场景绕过 @提及 检查）。
+        """
+        if not data or not getattr(data, "event", None):
+            return
+        try:
+            event   = data.event
+            message = getattr(event, "message", None)
+            matched = False
+            context = ""
+            if message is not None:
+                matched, context = self._match_trigger(message)
+            if not matched:
+                await super()._on_message(data)
+                return
+
+            message_id = getattr(message, "message_id", None) or ""
+            if self._auto_thread_on_trigger and message_id:
+                thread_id = str(
+                    getattr(message, "thread_id", "") or "",
+                ).strip()
+                if not thread_id:
+                    message.thread_id = message_id
+                    logger.info(
+                        "feishu-plus trigger auto-thread: msg=%s",
+                        message_id[:20],
+                    )
+            if context:
+                try:
+                    payload = json.loads(
+                        getattr(message, "content", None) or "{}",
+                    )
+                    text = str((payload or {}).get("text", "") or "")
+                    payload["text"] = f"{text}\n{context}" if text else context
+                    message.content = json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                    )
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "feishu-plus trigger: append context failed, raw "
+                        "content kept",
+                    )
+            token = _TRIGGER_MATCHED.set(True)
+            try:
+                await super()._on_message(data)
+            finally:
+                _TRIGGER_MATCHED.reset(token)
+        except Exception:
+            logger.exception("feishu plus _on_message failed")
+
+    def _check_group_mention(  # type: ignore[override]
+        self,
+        is_group: bool,
+        meta: Dict[str, Any],
+    ) -> bool:
+        """正则命中时绕过 @提及 检查，其余透传父类。
+
+        ``_TRIGGER_MATCHED`` 仅在 ``_on_message`` wrapper 内群消息
+        命中时置位（同一 task 直接 await，无并发串扰），p2p 路径
+        恒为 False，不受影响。
+        """
+        if _TRIGGER_MATCHED.get():
+            return True
+        return super()._check_group_mention(is_group, meta)
 
     # ------------------------------------------------------------------
     # resolve_session_id —— 话题感知的 session 聚合

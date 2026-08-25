@@ -26,7 +26,7 @@ class FeishuPlusPlugin:
                 "zh": "飞书+",
                 "en": "Feishu Plus",
             },
-            description="继承内置飞书渠道，修复话题内审批卡片发送路径，尝试话题内流式输出，并以 / 开头的命令消息跳过引用内容获取。需停用内置「飞书」渠道。",
+            description="继承内置飞书渠道，修复话题内审批卡片发送路径，尝试话题内流式输出，并以 / 开头的命令消息跳过引用内容获取；支持 YAML 正则触发规则（免 @提及、可追加场景上下文）与触发自动进话题。需停用内置「飞书」渠道。",
             icon="https://gw.alicdn.com/imgextra/i4/O1CN01jsn08m225euyUoaFN_!!6000000007069-2-tps-400-400.png",
             config_fields=[
                 {
@@ -147,6 +147,60 @@ class FeishuPlusPlugin:
                     "help": {
                         "zh": "开启后，群聊中仅在被 @提及 时才会回复",
                         "en": "enabled, bot only responds in group chats when explicitly @mentioned",
+                    },
+                },
+                {
+                    "name": "trigger_yaml_path",
+                    "label": {
+                        "zh": "触发规则 YAML",
+                        "en": "Trigger Rules YAML",
+                    },
+                    "type": "text",
+                    "required": False,
+                    "placeholder": "feishu_plus_triggers.yaml",
+                    "help": {
+                        "zh": (
+                            "触发规则文件路径，留空用默认 "
+                            "<workspace>/feishu_plus_triggers.yaml，"
+                            "相对路径相对 workspace 解析。文件为 "
+                            "triggers: 列表，每条 pattern（正则，"
+                            "re.search 语义）+ 可选 context；群消息正文"
+                            "命中任一 pattern 即触发回复（无需 @提及），"
+                            "context 会作为一行追加到正文末尾发送给 AI"
+                        ),
+                        "en": (
+                            "Trigger rules YAML path; empty = default "
+                            "<workspace>/feishu_plus_triggers.yaml "
+                            "(relative paths resolve against the "
+                            "workspace). Each rule is a regex pattern "
+                            "plus optional context; a matching group "
+                            "message triggers a reply without @mention, "
+                            "and the context is appended to the message "
+                            "text sent to the AI"
+                        ),
+                    },
+                },
+                {
+                    "name": "auto_thread_on_trigger",
+                    "label": {
+                        "zh": "触发自动进话题",
+                        "en": "Auto Thread on Trigger",
+                    },
+                    "type": "switch",
+                    "required": False,
+                    "default": False,
+                    "help": {
+                        "zh": (
+                            "正则触发且消息不在话题中时，机器人回复自动"
+                            "进入以该消息为根的话题；话题内后续消息共享"
+                            "同一会话上下文"
+                        ),
+                        "en": (
+                            "When a regex trigger fires on a message "
+                            "outside any topic thread, the bot reply "
+                            "automatically goes into a thread rooted at "
+                            "that message"
+                        ),
                     },
                 },
             ],

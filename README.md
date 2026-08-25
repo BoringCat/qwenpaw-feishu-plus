@@ -5,7 +5,9 @@ QwenPaw 飞书渠道增强插件（channel plugin）。继承内置 `FeishuChann
 - **话题内审批卡片** —— tool-guard 工具审批卡片发送到话题内（而非会话根），按钮点击后 `/approval` 命令也回注到原话题；
 - **话题内流式输出** —— CardKit 流式卡片在话题内创建与更新，失败自动回退纯文本；
 - **命令消息跳过引用获取** —— 以 `/` 开头的消息不抓取被回复卡片的内容，避免 `[quoted interactive: ...]` 前缀导致命令匹配失效；
-- **interactive 卡片 Markdown 渲染** —— 收到（含被回复引用）的 interactive 卡片渲染为结构化 Markdown（标题、正文、表格、@人名），修复内置实现丢失 `div` 正文、压成单行的问题。
+- **interactive 卡片 Markdown 渲染** —— 收到（含被回复引用）的 interactive 卡片渲染为结构化 Markdown（标题、正文、表格、@人名），修复内置实现丢失 `div` 正文、压成单行的问题；
+- **正则触发规则** —— YAML 文件配置正则列表，群消息正文命中即免 @提及 触发回复，规则可携带场景上下文追加到正文末尾；
+- **触发自动进话题** —— 正则触发且消息不在话题中时，机器人回复自动进入以该消息为根的话题。
 
 此外提供**话题级会话聚合**：话题内的群消息按 `thread_id` 聚合 session，同一话题共享一个会话上下文。
 
@@ -46,6 +48,24 @@ QwenPaw 飞书渠道增强插件（channel plugin）。继承内置 `FeishuChann
 | `access_control_dm` | 开关 | — | 关闭 | 开启后仅白名单用户可私聊机器人 |
 | `access_control_group` | 开关 | — | 关闭 | 开启后仅白名单用户可在群聊中与机器人互动 |
 | `require_mention` | 开关 | — | 关闭 | 群聊中仅被 @提及 时才回复 |
+| `trigger_yaml_path` | 文本 | — | `<workspace>/feishu_plus_triggers.yaml` | 触发规则 YAML 路径，相对路径相对 workspace 解析 |
+| `auto_thread_on_trigger` | 开关 | — | 关闭 | 正则触发且消息不在话题中时，回复自动进入以该消息为根的话题 |
+
+### 触发规则 YAML
+
+`trigger_yaml_path` 指向的文件（默认 `<workspace>/feishu_plus_triggers.yaml`）为 `triggers:` 列表，每条规则：
+
+```yaml
+triggers:
+  - pattern: "^告警|P[012]"          # 正则（re.search 语义）
+    context: "（运维告警场景，请按值班口径回复）"   # 可选：命中后追加到正文末尾
+  - pattern: "^小助手"                # 纯触发，不加上下文
+```
+
+- 群聊 **text** 消息正文命中任一 `pattern` 即触发回复，无需 @提及（`require_mention` 开启时同样生效；`require_mention` 关闭时所有消息本就触发，正则仍用于匹配 `context` 与自动进话题）；
+- 命中的规则取列表中**第一条**匹配项；`context` 作为一行追加到发给 AI 的消息正文末尾（与用户 @触发 时正文直接可见一致，正文原样保留、不剥离关键词）；
+- 无效正则条目跳过并记日志，不影响其余条目；文件格式由 pydantic 模型校验（`triggers` 为列表、`pattern` 必填非空字符串、`context` 可选字符串，多余字段 / 类型错误整份置空并记日志）；文件缺失 / 解析失败 / 结构不符只置空规则，不阻断渠道启动；
+- 「触发自动进话题」开启时，命中消息若不在话题中，机器人回复经 `reply_in_thread` 进入以该消息为根的话题，话题内后续消息按 `thread_id` 共享同一会话上下文；@提及 触发的消息保持普通回复、不自动建话题。
 
 ## 工作原理
 
@@ -57,7 +77,7 @@ src/
 ├── plugin.py         # 入口：注册渠道 + 声明配置字段
 ├── channel.py        # FeishuPlusChannel —— 话题级 session 聚合、
 │                     #   命令跳过引用、引用卡片 Markdown 渲染、
-│                     #   话题内流式卡片创建
+│                     #   话题内流式卡片创建、正则触发规则、自动进话题
 ├── card_markdown.py  # interactive 卡片 → Markdown 渲染器（纯逻辑）
 └── cards_override.py # 话题感知的 tool-guard 审批卡片 render + handle
 ```
@@ -66,6 +86,7 @@ src/
 - **话题内流式**：CardKit 流式 = ① `card.create` 得 `card_id` → ② 发 interactive 消息引用 `card_id` → ③ `card_element.content` 流式更新。仅 ② 受话题影响，插件让它在话题内改走话题内回复；若飞书话题不支持 CardKit 卡片，创建失败返回 `None`，自动回退为纯文本回复，不影响功能。
 - **命令跳过引用**：父类会把被回复的 interactive 卡片正文前置成 `[quoted interactive: ...]`，使命令文本不再以 `/` 开头、前缀匹配失效；跳过获取意味着不发 Get Message 请求，引用内容对命令场景本就无意义。
 - **卡片 Markdown 渲染**：内置 `extract_interactive_text` 把卡片压成单行，且 CardKit v2 卡片 `div` 的正文在 `text.content` 键（不在其递归的 child keys 里）会整体丢失。插件改用自研渲染器（`card_markdown.py`）：标题 → `# 标题`、`div`/`markdown` 正文保留（`<text_tag>` 去壳、`<at id=..>` → @名字、`<img>` → [图片]，emoji 短代码保留原样）、原生 `table` → GFM 表格、`note` → `> ` 引用块、`hr`/`button` 忽略。v1 卡片（顶层 `elements` + `markdown` tag）与 v2 / CardKit（`body.elements`）均支持。被引用（回复）卡片以 `> ` Markdown 引用块前置到消息文本，直接收到的卡片消息同样渲染完整 Markdown；渲染失败自动回退父类行为。`@` 名字解析复用 `_get_user_name_by_open_id`（带缓存），应用无 contact 权限或解析失败时回退 `@open_id后4位`。
+- **正则触发规则**：`_on_message` wrapper 在父类处理前完成匹配 —— 命中时改写事件数据（`context` 追加到 `content` 的 text 末尾、必要时注入 `thread_id = message_id`），并以 `ContextVar` 传递命中状态给 `_check_group_mention` 覆写以绕过 @提及 检查。父类流程对改写无感知：引用块仍前置正文、slash 命令前缀判断不受末尾追加影响。自动进话题复用父类话题管道（session 按 thread 聚合、`_reply_in_thread` 回复、流式卡片进话题），飞书话题根消息的 `thread_id` 即其自身 `message_id`，后续话题内消息携带相同值，会话天然连续。
 
 ## 已知限制
 
