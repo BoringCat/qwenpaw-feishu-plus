@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
-from src.channel import FeishuPlusChannel, _quote_block
+from qwenpaw_feishu_plus.channel import FeishuPlusChannel, _quote_block
 
 TEST_DATA = Path(__file__).parent / "test_data"
 

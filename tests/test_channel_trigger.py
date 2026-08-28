@@ -14,7 +14,7 @@ from typing import Any, List, Tuple
 import pytest
 from lark_oapi.api.im.v1.model.event_message import EventMessage
 
-from src.channel import FeishuPlusChannel, _TRIGGER_MATCHED
+from qwenpaw_feishu_plus.channel import FeishuPlusChannel, _TRIGGER_MATCHED
 
 _MSG_ID = "om_aaa0123456789abcdef0123456789bbb"
 

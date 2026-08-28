@@ -12,7 +12,7 @@ from typing import Dict, Optional
 
 import pytest
 
-from src.card_markdown import interactive_card_to_markdown
+from qwenpaw_feishu_plus.card_markdown import interactive_card_to_markdown
 
 TEST_DATA = Path(__file__).parent / "test_data"
 
@@ -348,7 +348,7 @@ _REAL_CARD = TEST_DATA / "zabbix_card.json"
 
 @pytest.mark.skipif(
     not _REAL_CARD.exists(),
-    reason="test_data/zabbix_card.json 未提供（含内网数据不入库，可自行放入脱敏版）",
+    reason="test_data/zabbix_card.json 未提供",
 )
 @pytest.mark.asyncio
 async def test_real_card_smoke() -> None:
