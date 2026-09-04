@@ -14,20 +14,34 @@ from typing import Any, List, Tuple
 import pytest
 from lark_oapi.api.im.v1.model.event_message import EventMessage
 
-from qwenpaw_feishu_plus.channel import FeishuPlusChannel, _TRIGGER_MATCHED
+from qwenpaw_feishu_plus.channel import (
+    FeishuPlusChannel,
+    _CompiledTrigger,
+    _TRIGGER_MATCHED,
+)
 
 _MSG_ID = "om_aaa0123456789abcdef0123456789bbb"
+_CHAT_ID = "oc_demo"
 
 
 def _make_channel(
-    rules: List[Tuple[str, str]],
+    rules: List[Tuple[Any, ...]],
     auto_thread: bool = False,
     require_mention: bool = True,
 ) -> FeishuPlusChannel:
-    """构造跳过 __init__ 的实例并注入触发规则。"""
+    """构造跳过 __init__ 的实例并注入触发规则。
+
+    ``rules`` 元素支持 (pattern, context) 或 (pattern, context, chat_ids)
+    两种形态；chat_ids 缺省为空（不限群）。
+    """
     ch = FeishuPlusChannel.__new__(FeishuPlusChannel)
     ch._trigger_rules = [
-        (re.compile(pattern), context) for pattern, context in rules
+        _CompiledTrigger(
+            pattern=re.compile(item[0]),
+            context=item[1] if len(item) > 1 else "",
+            chat_ids=tuple(item[2]) if len(item) > 2 else (),
+        )
+        for item in rules
     ]
     ch._auto_thread_on_trigger = auto_thread
     ch.require_mention = require_mention
@@ -41,12 +55,13 @@ def _text_message(
     message_type: str = "text",
     thread_id: str = "",
     message_id: str = _MSG_ID,
+    chat_id: str = _CHAT_ID,
 ) -> EventMessage:
     """构造 group text 事件消息（content 为飞书 text 消息 JSON）。"""
     return EventMessage(
         d={
             "message_id": message_id,
-            "chat_id": "oc_demo",
+            "chat_id": chat_id,
             "chat_type": chat_type,
             "message_type": message_type,
             "thread_id": thread_id,
@@ -185,6 +200,81 @@ def test_load_trigger_yaml_missing_file(tmp_path: Path) -> None:
     assert ch._trigger_rules == []
 
 
+def test_load_trigger_yaml_chat_ids(tmp_path: Path) -> None:
+    yaml_file = tmp_path / "triggers.yaml"
+    yaml_file.write_text(
+        "triggers:\n"
+        '  - pattern: "^告警"\n'
+        '    context: "值班"\n'
+        "    chat_ids:\n"
+        '      - " oc_a "\n'
+        "      - oc_b\n"
+        '  - pattern: "小助手"\n',  # 缺省 chat_ids → 不限群
+        encoding="utf-8",
+    )
+    ch = _make_channel([])
+    ch._load_trigger_yaml(yaml_file)
+
+    assert len(ch._trigger_rules) == 2
+    # chat_ids 条目去首尾空白。
+    assert ch._trigger_rules[0][2] == ("oc_a", "oc_b")
+    # 缺省为空元组（不限群）。
+    assert ch._trigger_rules[1][2] == ()
+
+
+def test_load_trigger_yaml_chat_ids_null_is_empty(tmp_path: Path) -> None:
+    yaml_file = tmp_path / "triggers.yaml"
+    yaml_file.write_text(
+        "triggers:\n"
+        '  - pattern: "^告警"\n'
+        "    chat_ids:\n",  # 显式 null → 不限群
+        encoding="utf-8",
+    )
+    ch = _make_channel([])
+    ch._load_trigger_yaml(yaml_file)
+
+    assert ch._trigger_rules[0][2] == ()
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param("42", id="non-string"),
+        pytest.param('""', id="empty-string"),
+    ],
+)
+def test_load_trigger_yaml_bad_chat_ids_rejected(
+    tmp_path: Path,
+    entry: str,
+) -> None:
+    yaml_file = tmp_path / "triggers.yaml"
+    yaml_file.write_text(
+        "triggers:\n"
+        '  - pattern: "^告警"\n'
+        "    chat_ids:\n"
+        f"      - {entry}\n",  # 非字符串 / 空条目 → 整份置空
+        encoding="utf-8",
+    )
+    ch = _make_channel([("old", "ctx")])
+    ch._load_trigger_yaml(yaml_file)
+
+    assert ch._trigger_rules == []
+
+
+def test_load_trigger_yaml_chat_ids_scalar_rejected(tmp_path: Path) -> None:
+    yaml_file = tmp_path / "triggers.yaml"
+    yaml_file.write_text(
+        "triggers:\n"
+        '  - pattern: "^告警"\n'
+        '    chat_ids: "oc_a"\n',  # 标量而非列表 → 整份置空
+        encoding="utf-8",
+    )
+    ch = _make_channel([("old", "ctx")])
+    ch._load_trigger_yaml(yaml_file)
+
+    assert ch._trigger_rules == []
+
+
 # ====================================================================
 # _match_trigger
 # ====================================================================
@@ -241,6 +331,54 @@ def test_match_trigger_bad_content_json() -> None:
     msg = _text_message("告警")
     msg.content = "not json"
     assert ch._match_trigger(msg) == (False, "")
+
+
+def test_match_trigger_chat_ids_whitelist() -> None:
+    # 规则1 限定 _CHAT_ID；规则2 不限群 —— 取第一条可命中的规则。
+    ch = _make_channel(
+        [
+            (r"告警", "场景A", (_CHAT_ID,)),
+            (r"告警", "场景B"),
+        ],
+    )
+    # 白名单内的群：规则1 命中。
+    assert ch._match_trigger(_text_message("告警了")) == (True, "场景A")
+    # 白名单之外的群：跳过规则1，规则2 命中。
+    assert ch._match_trigger(
+        _text_message("告警了", chat_id="oc_other"),
+    ) == (True, "场景B")
+
+
+def test_match_trigger_chat_ids_no_match_outside() -> None:
+    ch = _make_channel([(r"告警", "ctx", (_CHAT_ID,))])
+    assert ch._match_trigger(_text_message("告警")) == (True, "ctx")
+    assert ch._match_trigger(
+        _text_message("告警", chat_id="oc_other"),
+    ) == (False, "")
+
+
+def test_match_trigger_chat_ids_multi_group() -> None:
+    ch = _make_channel([(r"告警", "ctx", ("oc_a", "oc_b"))])
+    assert ch._match_trigger(_text_message("告警", chat_id="oc_b")) == (
+        True,
+        "ctx",
+    )
+    assert ch._match_trigger(
+        _text_message("告警", chat_id="oc_c"),
+    ) == (False, "")
+
+
+def test_match_trigger_chat_ids_blank_message_chat() -> None:
+    # 规则限定群但消息缺 chat_id：不命中；不限群的规则仍命中。
+    ch = _make_channel(
+        [
+            (r"告警", "ctxA", ("oc_a",)),
+            (r"告警", "ctxB"),
+        ],
+    )
+    assert ch._match_trigger(
+        _text_message("告警", chat_id=""),
+    ) == (True, "ctxB")
 
 
 # ====================================================================
@@ -371,4 +509,23 @@ def test_on_message_no_match_untouched(
     assert msg.thread_id == ""
     assert json.loads(msg.content) == {"text": "今天天气不错"}
     # 未命中不置 ContextVar。
+    assert record["flag"] is False
+
+
+def test_on_message_chat_ids_gate_prevents_injection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 规则限定 _CHAT_ID；消息来自其他群 —— 正文虽命中但整体不触发：
+    # 不注入 thread_id、不改写 content、ContextVar 保持 False。
+    record = _stub_super(monkeypatch)
+    ch = _make_channel([("告警", "ctx", (_CHAT_ID,))], auto_thread=True)
+    msg = _text_message("告警", chat_id="oc_other")
+
+    import asyncio
+
+    asyncio.run(ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg))))
+
+    assert record["calls"] == 1
+    assert msg.thread_id == ""
+    assert json.loads(msg.content) == {"text": "告警"}
     assert record["flag"] is False

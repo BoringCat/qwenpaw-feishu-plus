@@ -26,7 +26,7 @@ class FeishuPlusPlugin:
                 "zh": "飞书+",
                 "en": "Feishu Plus",
             },
-            description="继承内置飞书渠道，修复话题内审批卡片发送路径，尝试话题内流式输出，并以 / 开头的命令消息跳过引用内容获取；支持 YAML 正则触发规则（免 @提及、可追加场景上下文）与触发自动进话题。需停用内置「飞书」渠道。",
+            description="继承内置飞书渠道，修复话题内审批卡片发送路径，尝试话题内流式输出（以 / 开头的命令消息除外，自动回退纯文本），并以 / 开头的命令消息跳过引用内容获取；支持 YAML 正则触发规则（免 @提及、可追加场景上下文）与触发自动进话题。需停用内置「飞书」渠道。",
             icon="https://gw.alicdn.com/imgextra/i4/O1CN01jsn08m225euyUoaFN_!!6000000007069-2-tps-400-400.png",
             config_fields=[
                 {
@@ -162,21 +162,13 @@ class FeishuPlusPlugin:
                         "zh": (
                             "触发规则文件路径，留空用默认 "
                             "<workspace>/feishu_plus_triggers.yaml，"
-                            "相对路径相对 workspace 解析。文件为 "
-                            "triggers: 列表，每条 pattern（正则，"
-                            "re.search 语义）+ 可选 context；群消息正文"
-                            "命中任一 pattern 即触发回复（无需 @提及），"
-                            "context 会作为一行追加到正文末尾发送给 AI"
+                            "相对路径相对 workspace 解析"
                         ),
                         "en": (
                             "Trigger rules YAML path; empty = default "
                             "<workspace>/feishu_plus_triggers.yaml "
                             "(relative paths resolve against the "
-                            "workspace). Each rule is a regex pattern "
-                            "plus optional context; a matching group "
-                            "message triggers a reply without @mention, "
-                            "and the context is appended to the message "
-                            "text sent to the AI"
+                            "workspace)."
                         ),
                     },
                 },
@@ -204,6 +196,22 @@ class FeishuPlusPlugin:
                     },
                 },
             ],
+        )
+        # /feishu-plus 触发规则管理命令：show-triggers（查看生效触发规则）
+        # / reload-triggers（重新加载规则 YAML）。handler 在 channel.py，
+        # 经 SlashCommandRegistry 分派到各 workspace（与内置 /daemon
+        # 等 control 命令同一机制）。
+        from .channel import feishu_plus_command_handler
+
+        api.register_slash_command(
+            name="feishu-plus",
+            handler=feishu_plus_command_handler,
+            category="plugin",
+            help_text=(
+                "飞书+ 触发规则管理："
+                "/feishu-plus show-triggers 查看生效规则；"
+                "/feishu-plus reload-triggers 重新加载规则 YAML"
+            ),
         )
         logger.info("✓ Feishu Plus channel registered")
 

@@ -8,7 +8,9 @@ registry 跳过）。全部收发 / WebSocket / CardKit / 媒体能力继承自�
 1. 覆盖 tool-guard 审批卡片的 render —— 话题内走 ``_reply_in_thread``
    + ``msg_type="interactive"``（见 cards_override）。
 2. 放开话题内流式输出的三处跳过（实验性，依赖飞书话题对 CardKit
-   interactive 卡片的支持；失败自动回退纯文本）。
+   interactive 卡片的支持；失败自动回退纯文本）。以 ``/`` 开头的
+   命令消息除外 —— 不创建流式卡片，回复始终以纯文本发出（见
+   ``_before_consume_process`` / ``on_streaming_start``）。
 3. 以 ``/`` 开头的消息（控制命令）跳过引用消息获取 —— 用户回复
    机器人卡片时输入命令，父类抓回引用的 interactive 卡片内容并前置
    ``[quoted interactive: ...]``，会让命令文本不再以 ``/`` 开头。
@@ -18,11 +20,17 @@ registry 跳过）。全部收发 / WebSocket / CardKit / 媒体能力继承自�
    interactive 消息与被引用（quoted）卡片都改为完整 Markdown 渲染，
    quoted 时以 ``> `` 引用块前置。
 5. 正则触发规则（YAML 文件配置）—— 群消息正文命中任一正则时绕过
-   ``require_mention`` 的 @提及 检查；规则可携带 ``context``，命中时
-   追加到消息正文末尾一并发送给 AI（见 ``_load_trigger_yaml``）。
+   ``require_mention`` 的 @提及 检查；规则可携带 ``context``（命中时
+   追加到消息正文末尾一并发送给 AI）与 ``chat_ids``（按群 chat_id
+   白名单限定，缺省全部群生效），见 ``_load_trigger_yaml``。
 6. 自动进话题 —— 正则触发且消息不在话题中时，向事件注入
    ``thread_id = message_id``，父类话题管道（session 聚合 / 话题回复 /
    流式卡片）全部自动复用（见 ``_on_message``）。
+7. ``/feishu-plus`` 管理命令 —— 经 ``plugin.py`` 以
+   ``register_slash_command`` 注册，handler 从 ctx 定位本渠道实例后
+   执行子命令：``show-triggers``（查看当前触发配置）与
+   ``reload-triggers``（重新加载规则 YAML），见 ``describe_triggers`` /
+   ``reload_triggers``。
 """
 from __future__ import annotations
 
@@ -31,14 +39,24 @@ import logging
 import re
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+)
 
 from qwenpaw.app.channels.feishu.channel import FeishuChannel, _MSG_TYPE_LABEL
 from qwenpaw.app.channels.feishu.constants import FEISHU_STREAM_ELEMENT_ID
 from qwenpaw.app.channels.feishu.utils import short_session_id_from_full_id
 from qwenpaw.app.channels.renderer import ChannelDisplayConfig
+from qwenpaw.runtime.hooks import HookContext
+from qwenpaw.app.workspace.workspace import Workspace
+from qwenpaw.app.channels.manager import ChannelManager
+from agentscope.message import Msg
 
 from .card_markdown import interactive_card_to_markdown, quote_lines
 
@@ -55,6 +73,21 @@ _TRIGGER_MATCHED: ContextVar[bool] = ContextVar(
 # 触发规则 YAML 的默认文件名（位于 workspace 根目录下）。
 _TRIGGER_YAML_DEFAULT_NAME = "feishu_plus_triggers.yaml"
 
+# ``/feishu-plus`` 命令（show-triggers / reload-triggers）的用法说明，
+# 无参数或未知子命令时展示给用户。
+_TRIGGER_COMMAND_USAGE = (
+    "feishu-plus 触发规则管理命令\n\n"
+    "用法:\n"
+    "  /feishu-plus show-triggers      查看当前生效的触发规则配置\n"
+    "  /feishu-plus reload-triggers    重新加载规则 YAML 文件"
+)
+
+# request 动态属性名：以 ``/`` 开头的命令消息本次请求跳过流式输出。
+# ``_before_consume_process`` 在 agent 运行前判定并置位，
+# ``on_streaming_start`` 在事件循环中读取 —— 两者共享同一 AgentRequest
+# 实例（与父类 ``_precreated_card`` 的跨方法传递方式一致）。
+_NO_STREAMING_REQUEST_ATTR = "_feishu_plus_no_streaming"
+
 
 # ── 触发规则 YAML 的 pydantic 模型 ──
 #
@@ -66,12 +99,15 @@ _TRIGGER_YAML_DEFAULT_NAME = "feishu_plus_triggers.yaml"
 
 
 class TriggerRule(BaseModel):
-    """单条触发规则：正则 ``pattern``（必填）+ 可选 ``context``。"""
+    """单条触发规则：正则 ``pattern``（必填）+ 可选 ``context`` /
+    ``chat_ids``。"""
 
     model_config = ConfigDict(extra="forbid")
 
     pattern: str
     context: str = ""
+    # 限定规则生效的群（chat_id 白名单）；空 = 全部群生效。
+    chat_ids: List[str] = Field(default_factory=list)
 
     @field_validator("pattern", mode="before")
     @classmethod
@@ -91,6 +127,26 @@ class TriggerRule(BaseModel):
             return ""
         return value.strip() if isinstance(value, str) else value
 
+    @field_validator("chat_ids", mode="before")
+    @classmethod
+    def _chat_ids_null_is_empty(cls, value: Any) -> Any:
+        """``null`` 视作空列表（不限群）；非列表由类型校验报错。"""
+        if value is None:
+            return []
+        return value
+
+    @field_validator("chat_ids", mode="after")
+    @classmethod
+    def _normalize_chat_ids(cls, value: List[str]) -> List[str]:
+        """chat_ids 逐项去首尾空白；空条目报错（不该出现的配置）。"""
+        cleaned = []
+        for item in value:
+            item = item.strip()
+            if not item:
+                raise ValueError("chat_ids entries must not be empty")
+            cleaned.append(item)
+        return cleaned
+
 
 class TriggerRulesFile(BaseModel):
     """触发规则 YAML 顶层结构：``triggers`` 规则列表。"""
@@ -98,6 +154,18 @@ class TriggerRulesFile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     triggers: List[TriggerRule]
+
+
+class _CompiledTrigger(NamedTuple):
+    """编译好的单条规则：pattern + context + chat_ids（空 = 全部群）。
+
+    ``_trigger_rules`` 的元素类型；NamedTuple 便于测试按索引断言
+    （[0] pattern / [1] context / [2] chat_ids）。
+    """
+
+    pattern: re.Pattern
+    context: str = ""
+    chat_ids: Tuple[str, ...] = ()
 
 
 def _quote_block(text: str) -> str:
@@ -143,9 +211,14 @@ class FeishuPlusChannel(FeishuChannel):
         )
 
         # ── 正则触发规则（from_config 覆盖；见 _load_trigger_yaml） ──
-        self._trigger_rules: List[Tuple[re.Pattern, str]] = []
+        self._trigger_rules: List[_CompiledTrigger] = []
         self._trigger_yaml_path: str = ""
         self._auto_thread_on_trigger: bool = False
+        # 最近一次 yaml 加载的结果状态，供 /feishu-plus 命令向用户反馈
+        # （_load_trigger_yaml 每次调用先复位再按失败分支填充）。
+        self._trigger_load_error: str = ""
+        # 最近一次加载中被跳过（正则非法）的规则条数。
+        self._trigger_skipped: int = 0
 
     # ------------------------------------------------------------------
     # from_config —— 插件频道的 config 是 SimpleNamespace（非 Pydantic）
@@ -225,13 +298,19 @@ class FeishuPlusChannel(FeishuChannel):
 
         文件结构由 ``TriggerRulesFile`` / ``TriggerRule`` 两个 pydantic
         模型校验：``triggers`` 为规则列表，每条 ``pattern``（正则，
-        ``re.search`` 语义）为必填非空字符串、``context`` 可选字符串，
-        多余字段与类型错误整份置空。正则编译失败逐条跳过并告警，
-        不影响其余条目。文件不存在 / 解析失败 / 结构不符只记日志并
-        置空规则，不抛异常 —— 触发规则是增强能力，不应因配置问题
-        阻断渠道启动。
+        ``re.search`` 语义）为必填非空字符串、``context`` 与 ``chat_ids``
+        可选（后者为群 chat_id 白名单，空 = 全部群生效），多余字段与
+        类型错误整份置空。正则编译失败逐条跳过并告警，不影响其余条目。
+        文件不存在 / 解析失败 / 结构不符只记日志并置空规则，不抛异常
+        —— 触发规则是增强能力，不应因配置问题阻断渠道启动。
+
+        调用副作用（供 ``/feishu-plus`` 命令反馈）：失败时置
+        ``self._trigger_load_error`` 为人类可读原因（成功 / 默认文件缺失
+        则保持空串），被跳过的非法正则条数写入 ``self._trigger_skipped``。
         """
         self._trigger_rules = []
+        self._trigger_load_error = ""
+        self._trigger_skipped = 0
         if not path or not path.is_file():
             if path is not None and str(path).endswith(
                 _TRIGGER_YAML_DEFAULT_NAME,
@@ -243,6 +322,7 @@ class FeishuPlusChannel(FeishuChannel):
                 logger.warning(
                     "feishu-plus trigger yaml not found: %s", path,
                 )
+                self._trigger_load_error = f"文件不存在: {path}"
             return
         try:
             import yaml
@@ -254,6 +334,7 @@ class FeishuPlusChannel(FeishuChannel):
                 path,
                 exc_info=True,
             )
+            self._trigger_load_error = "文件解析失败（非法 YAML）"
             return
         try:
             rules_file = TriggerRulesFile.model_validate(data)
@@ -263,11 +344,17 @@ class FeishuPlusChannel(FeishuChannel):
                 path,
                 exc,
             )
+            # ValidationError 消息多行且含 schema 定位，首行即可作
+            # 命令反馈（完整信息在日志中）。
+            first_line = str(exc).splitlines()[0] if exc.errors() else str(exc)
+            self._trigger_load_error = f"文件结构非法: {first_line[:120]}"
             return
+        skipped = 0
         for idx, rule in enumerate(rules_file.triggers):
             try:
                 pattern = re.compile(rule.pattern)
             except re.error as exc:
+                skipped += 1
                 logger.warning(
                     "feishu-plus trigger yaml: rule #%d invalid regex "
                     "%r (%s), skipped",
@@ -276,12 +363,99 @@ class FeishuPlusChannel(FeishuChannel):
                     exc,
                 )
                 continue
-            self._trigger_rules.append((pattern, rule.context))
+            self._trigger_rules.append(
+                _CompiledTrigger(pattern, rule.context, tuple(rule.chat_ids)),
+            )
+        if skipped:
+            self._trigger_skipped = skipped
         logger.info(
             "feishu-plus trigger rules loaded: %d from %s",
             len(self._trigger_rules),
             path,
         )
+
+    # ------------------------------------------------------------------
+    # /feishu-plus 管理命令支持 —— show-triggers / reload-triggers
+    # ------------------------------------------------------------------
+
+    def describe_triggers(self) -> str:
+        """生成当前触发规则配置的人类可读文本（show-triggers）。
+
+        列出规则文件路径、相关触发开关与逐条生效规则（pattern /
+        context / chat_ids 白名单）。规则为空时给出原因（文件缺失 /
+        加载失败 / 文件中没有规则），便于运维定位。
+        """
+        rules = list(getattr(self, "_trigger_rules", None) or [])
+        path = str(getattr(self, "_trigger_yaml_path", "") or "")
+        error = str(getattr(self, "_trigger_load_error", "") or "")
+        auto_thread = bool(getattr(self, "_auto_thread_on_trigger", False))
+
+        lines = [
+            f"feishu-plus 触发规则（生效 {len(rules)} 条）",
+            f"规则文件: {path or '（未配置 trigger_yaml_path）'}",
+            f"auto_thread_on_trigger: {'开' if auto_thread else '关'}",
+        ]
+        if error:
+            lines.append(f"最近一次加载失败: {error}")
+        elif not rules:
+            if not path or not Path(path).is_file():
+                lines.append("状态: 规则文件不存在，未配置任何触发规则")
+            else:
+                lines.append("状态: 规则文件中没有生效的触发规则")
+        for idx, rule in enumerate(rules, start=1):
+            scope = (
+                "全部群"
+                if not rule.chat_ids
+                else "群白名单: " + "、".join(rule.chat_ids)
+            )
+            lines.append("")
+            lines.append(f"{idx}. pattern: {rule.pattern.pattern}")
+            if rule.context:
+                lines.append(f"   context: {rule.context}")
+            lines.append(f"   生效范围: {scope}")
+        if getattr(self, "_trigger_skipped", 0):
+            lines.append(
+                ""
+                f"（本次加载 {self._trigger_skipped} 条非法正则被跳过）",
+            )
+        return "\n".join(lines)
+
+    def reload_triggers(self) -> str:
+        """重新从 ``_trigger_yaml_path`` 加载触发规则并返回可读结果。
+
+        与启动共用 ``_load_trigger_yaml``，改完 YAML 后免重启生效。
+        加载失败（文件缺失 / 非法 YAML / 结构错误）时**保留上一份生效
+        规则**并回滚 —— 一次格式错误不应清空线上正在工作的规则集。
+        """
+        path = str(getattr(self, "_trigger_yaml_path", "") or "")
+        if not path:
+            return "未配置规则文件（trigger_yaml_path 为空），无法重新加载。"
+        previous = list(getattr(self, "_trigger_rules", None) or [])
+        path_obj = Path(path)
+        # 主动 reload 时文件缺失同样视为失败：默认路径缺失在启动时是正常
+        # 的「未配置」，但 reload 的语义是「让当前文件生效」，应显式反馈。
+        if path_obj.is_file():
+            self._load_trigger_yaml(path_obj)
+        else:
+            self._trigger_rules = []
+            self._trigger_load_error = f"文件不存在: {path}"
+            self._trigger_skipped = 0
+        error = str(getattr(self, "_trigger_load_error", "") or "")
+        if error:
+            # 回滚到上一份生效规则；error 保留供 describe_triggers 展示。
+            self._trigger_rules = previous
+            if previous:
+                return (
+                    f"重新加载失败: {error}\n"
+                    f"已回滚，继续使用上一份生效规则（{len(previous)} 条）。\n"
+                    "修复 YAML 后可再次执行本命令。"
+                )
+            return f"重新加载失败: {error}\n当前没有生效的触发规则。"
+        skipped = int(getattr(self, "_trigger_skipped", 0) or 0)
+        head = f"触发规则已重新加载，生效 {len(self._trigger_rules)} 条。"
+        if skipped:
+            head += f"（其中 {skipped} 条正则非法被跳过，详见日志）"
+        return f"{head}\n\n{self.describe_triggers()}"
 
     def _match_trigger(
         self,
@@ -289,10 +463,11 @@ class FeishuPlusChannel(FeishuChannel):
     ) -> Tuple[bool, str]:
         """群 text 消息正文匹配触发规则。
 
-        返回 ``(matched, context)``：第一条 ``pattern.search`` 命中的
-        规则的 context（未配置则为空串）；未命中 / 非群 / 非 text /
-        正文解析失败均返回 ``(False, "")``。仅匹配 text 类型 —— 正则
-        面向文本，富文本（post）与媒体消息结构各异，不猜。
+        返回 ``(matched, context)``：第一条 ``pattern.search`` 命中且
+        群 chat_id 在规则 ``chat_ids`` 白名单内（或规则不限群）的
+        context（未配置则为空串）；未命中 / 非群 / 非 text / 正文解析
+        失败均返回 ``(False, "")``。仅匹配 text 类型 —— 正则面向文本，
+        富文本（post）与媒体消息结构各异，不猜。
         """
         if not self._trigger_rules:
             return False, ""
@@ -304,6 +479,7 @@ class FeishuPlusChannel(FeishuChannel):
             getattr(message, "message_type", "") or "",
         ).strip() != "text":
             return False, ""
+        chat_id = str(getattr(message, "chat_id", "") or "").strip()
         content_raw = getattr(message, "content", None) or ""
         try:
             text = str(
@@ -311,9 +487,12 @@ class FeishuPlusChannel(FeishuChannel):
             )
         except (ValueError, TypeError):
             return False, ""
-        for pattern, context in self._trigger_rules:
-            if pattern.search(text):
-                return True, context
+        for rule in self._trigger_rules:
+            # 规则限定群且当前群不在白名单 → 跳过该规则，继续找下一条。
+            if rule.chat_ids and chat_id not in rule.chat_ids:
+                continue
+            if rule.pattern.search(text):
+                return True, rule.context
         return False, ""
 
     async def _on_message(  # type: ignore[override]
@@ -673,8 +852,14 @@ class FeishuPlusChannel(FeishuChannel):
         stream_type: str,
         accumulated_text: str = "",
     ) -> None:
-        """话题内也创建流式卡片（不再 return 跳过）。"""
+        """话题内也创建流式卡片（不再 return 跳过）；以 ``/`` 开头的
+        命令消息除外 —— 返回后不创建任何卡片，``on_streaming_end`` 会以
+        纯文本回退发送完整结果，命令回复保持非流式。
+        """
         if not self.streaming_enabled:
+            return
+        # 命令消息（_before_consume_process 已置标记）不创建流式卡片。
+        if getattr(request, _NO_STREAMING_REQUEST_ATTR, False):
             return
         # 父类在此处有 `if send_meta.get("feishu_thread_id"): return`
         # —— 本增强移除该跳过。
@@ -713,8 +898,22 @@ class FeishuPlusChannel(FeishuChannel):
                 "sequence": 0,
             }
 
+    def _request_is_slash_command(self, request: Any) -> bool:
+        """request 的用户正文是否以 ``/`` 开头（命令消息）。
+
+        复用 base 的 ``_extract_query_from_payload`` 提取首段 query 文本
+        （父类 ``_on_message`` 已剥离 mention key，命令消息也跳过引用
+        获取，正文以 ``/`` 开头即命令），判定与 ``_process_quoted_message``
+        一致。
+        """
+        query = self._extract_query_from_payload(request) or ""
+        return query.strip().startswith("/")
+
     async def _before_consume_process(self, request: Any) -> None:
-        """话题内也预创建流式卡片（不再跳过）。"""
+        """话题内也预创建流式卡片（不再跳过）；以 ``/`` 开头的命令
+        消息除外 —— 置 ``_NO_STREAMING_REQUEST_ATTR`` 并跳过预创建，
+        ``on_streaming_start`` 读到标记后不再创建，结果以纯文本发送。
+        """
         meta = getattr(request, "channel_meta", None) or {}
         receive_id = meta.get("feishu_receive_id")
         receive_id_type = meta.get("feishu_receive_id_type", "open_id")
@@ -725,12 +924,21 @@ class FeishuPlusChannel(FeishuChannel):
                 receive_id_type,
             )
 
+        # 命令消息（用户正文以 / 开头）不流式输出：跳过预创建并标记
+        # request，供 on_streaming_start 复用同一判定。与
+        # _process_quoted_message 对 / 命令跳过引用获取是同一语义
+        # （正文同样已剥离 mention key）。
+        is_slash_command = self._request_is_slash_command(request)
+        if is_slash_command:
+            setattr(request, _NO_STREAMING_REQUEST_ATTR, True)
+
         # 预创建流式卡片；与父类的区别：不再因为 feishu_thread_id 跳过，
         # 并在话题时把 feishu_message_id 透传给 _reply_in_thread。
         if (
             self.streaming_enabled
             and receive_id
             and not meta.get("from_card_action")
+            and not is_slash_command
         ):
             thread_msg_id = ""
             if meta.get("feishu_thread_id"):
@@ -749,3 +957,62 @@ class FeishuPlusChannel(FeishuChannel):
                     "feishu-plus streaming card pre-creation failed",
                     exc_info=True,
                 )
+
+
+# ======================================================================
+# /feishu-plus 管理命令（slash command）handler
+#
+# ``plugin.py`` 经 ``api.register_slash_command`` 注册到每个 workspace 的
+# ``SlashCommandRegistry``；用户文本 ``/feishu-plus <sub>`` 在
+# ``Runtime.run`` 的固定命令阶段被 dispatch，剩余文本即 ``args``。handler
+# 从 ctx 的 workspace channel_manager 定位当前 ``feishu_plus`` 渠道实例，
+# 调用其触发规则支持方法并把结果作为回复 Msg 返回（协议与内置 control
+# 命令一致，见 runtime/builtin_commands.py）。
+# ======================================================================
+
+
+def _command_reply(text: str) -> Any:
+    """把命令结果文本包装成 slash 命令回复的 agentscope ``Msg``。"""
+    from agentscope.message import Msg, TextBlock
+
+    return Msg(
+        name="assistant",
+        role="assistant",
+        content=[TextBlock(type="text", text=text)],
+    )
+
+
+async def feishu_plus_command_handler(ctx: HookContext, args: str) -> Msg|None:
+    """``/feishu-plus`` 触发规则管理命令 handler。
+
+    子命令：``show-triggers``（查看当前触发配置）、``reload-triggers``
+    （重新加载规则 YAML）。无参数或未知子命令时返回用法说明。
+    """
+    # 定位当前 workspace 的 feishu_plus 渠道实例（启用时才存在）。
+    workspace:Workspace = getattr(ctx, "workspace", None)
+    channel = None
+    manager:ChannelManager = (
+        getattr(workspace, "channel_manager", None)
+        if workspace is not None
+        else None
+    )
+    if manager is not None:
+        try:
+            candidate = await manager.get_channel("feishu_plus")
+        except Exception:
+            candidate = None
+        if isinstance(candidate, FeishuPlusChannel):
+            channel = candidate
+    if channel is None:
+        return _command_reply(
+            "「飞书+」渠道未启用，无法执行该命令。\n\n" + _TRIGGER_COMMAND_USAGE,
+        )
+
+    sub = (args or "").strip().lower()
+    if not sub or sub == "help":
+        return _command_reply(_TRIGGER_COMMAND_USAGE)
+    if sub == "show-triggers":
+        return _command_reply(channel.describe_triggers())
+    if sub == "reload-triggers":
+        return _command_reply(channel.reload_triggers())
+    return _command_reply(f"未知子命令: {sub}\n\n" + _TRIGGER_COMMAND_USAGE)
