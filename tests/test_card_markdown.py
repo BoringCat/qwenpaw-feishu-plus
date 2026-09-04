@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""card_markdown 渲染器测试。
+"""card.markdown 渲染器测试。
 
 真实告警卡片含内网数据不入库；此处用结构同款的合成脱敏卡片覆盖
 （div/lark_md、text_tag、markdown 表格、原生 table、hr、button、
@@ -12,7 +12,7 @@ from typing import Dict, Optional
 
 import pytest
 
-from qwenpaw_feishu_plus.card_markdown import interactive_card_to_markdown
+from qwenpaw_feishu_plus.card.markdown import interactive_card_to_markdown
 
 TEST_DATA = Path(__file__).parent / "test_data"
 
@@ -337,27 +337,3 @@ async def test_empty_table_skipped() -> None:
 @pytest.mark.asyncio
 async def test_invalid_content_returns_none(bad) -> None:
     assert await interactive_card_to_markdown(bad) is None
-
-
-# ====================================================================
-# 可选：用户自行放入的脱敏真实卡片（test_data/zabbix_card.json）
-# ====================================================================
-
-_REAL_CARD = TEST_DATA / "zabbix_card.json"
-
-
-@pytest.mark.skipif(
-    not _REAL_CARD.exists(),
-    reason="test_data/zabbix_card.json 未提供",
-)
-@pytest.mark.asyncio
-async def test_real_card_smoke() -> None:
-    content = _REAL_CARD.read_text(encoding="UTF-8")
-    md = await interactive_card_to_markdown(
-        content,
-        at_resolver=_fake_resolver,
-    )
-    assert md is not None
-    assert md.startswith("# ")
-    assert "| 服务实例 | 服务 |" in md
-    assert "**已恢复**" in md

@@ -12,7 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
-from qwenpaw_feishu_plus.channel import FeishuPlusChannel, _quote_block
+from qwenpaw_feishu_plus.channel import FeishuPlusChannel
+from qwenpaw_feishu_plus.card.markdown import quote_block
 
 TEST_DATA = Path(__file__).parent / "test_data"
 
@@ -197,11 +198,11 @@ async def test_parse_text_passthrough(
 
 
 # ====================================================================
-# _quote_block
+# quote_block
 # ====================================================================
 
 
 def test_quote_block() -> None:
-    assert _quote_block("# 标题\n\n正文") == "> # 标题\n>\n> 正文\n"
+    assert quote_block("# 标题\n\n正文") == "> # 标题\n>\n> 正文\n"
     # 行内空格不误判为空行。
-    assert _quote_block("a") == "> a\n"
+    assert quote_block("a") == "> a\n"

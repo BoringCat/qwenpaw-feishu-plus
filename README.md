@@ -87,20 +87,21 @@ triggers:
 
 ```
 src/
-├── plugin.json       # 插件清单（id: feishu-plus, type: channel）
-├── plugin.py         # 入口：注册渠道 + 声明配置字段
-├── channel.py        # FeishuPlusChannel —— 话题级 session 聚合、
-│                     #   命令跳过引用、引用卡片 Markdown 渲染、
-│                     #   话题内流式卡片创建、正则触发规则、自动进话题
-├── card_markdown.py  # interactive 卡片 → Markdown 渲染器（纯逻辑）
-└── cards_override.py # 话题感知的 tool-guard 审批卡片 render + handle
+├── plugin.json # 插件清单（id: feishu-plus, type: channel）
+├── plugin.py   # 入口：注册渠道 + 声明配置字段
+├── channel.py  # FeishuPlusChannel —— 话题级 session 聚合、
+│               #   命令跳过引用、引用卡片 Markdown 渲染、
+│               #   话题内流式卡片创建、正则触发规则、自动进话题
+├── card/
+    ├── markdown.py  # interactive 卡片 → Markdown 渲染器（纯逻辑）
+    └── override.py # 话题感知的 tool-guard 审批卡片 render + handle
 ```
 
 - **审批卡片**：复用上游 `tool_guard` 的无状态构造/解析函数，仅把「话题路由」收敛到本插件——render 时强制把 `feishu_thread_id` / `feishu_message_id` 写进按钮 `session_ctx`，handle 时读回并让 `/approval` 命令落回原话题。因此 site-packages 的 `tool_guard.py` / `context.py` 可保持上游版本。
 - **话题内流式**：CardKit 流式 = ① `card.create` 得 `card_id` → ② 发 interactive 消息引用 `card_id` → ③ `card_element.content` 流式更新。仅 ② 受话题影响，插件让它在话题内改走话题内回复；若飞书话题不支持 CardKit 卡片，创建失败返回 `None`，自动回退为纯文本回复，不影响功能。
 - **命令跳过引用**：父类会把被回复的 interactive 卡片正文前置成 `[quoted interactive: ...]`，使命令文本不再以 `/` 开头、前缀匹配失效；跳过获取意味着不发 Get Message 请求，引用内容对命令场景本就无意义。
 - **命令消息不流式**：以 `/` 开头的命令消息在 `_before_consume_process` 预创建流式卡片时即被判定（`request` 正文首段以 `/` 开头），跳过预创建并把标志写到 request；`on_streaming_start` 读到标志直接返回、不建卡片，结果经父类 `on_streaming_end` 的纯文本回退发出。会话根与话题内两条路径均生效。
-- **卡片 Markdown 渲染**：内置 `extract_interactive_text` 把卡片压成单行，且 CardKit v2 卡片 `div` 的正文在 `text.content` 键（不在其递归的 child keys 里）会整体丢失。插件改用自研渲染器（`card_markdown.py`）：标题 → `# 标题`、`div`/`markdown` 正文保留（`<text_tag>` 去壳、`<at id=..>` → @名字、`<img>` → [图片]，emoji 短代码保留原样）、原生 `table` → GFM 表格、`note` → `> ` 引用块、`hr`/`button` 忽略。v1 卡片（顶层 `elements` + `markdown` tag）与 v2 / CardKit（`body.elements`）均支持。被引用（回复）卡片以 `> ` Markdown 引用块前置到消息文本，直接收到的卡片消息同样渲染完整 Markdown；渲染失败自动回退父类行为。`@` 名字解析复用 `_get_user_name_by_open_id`（带缓存），应用无 contact 权限或解析失败时回退 `@open_id后4位`。
+- **卡片 Markdown 渲染**：内置 `extract_interactive_text` 把卡片压成单行，且 CardKit v2 卡片 `div` 的正文在 `text.content` 键（不在其递归的 child keys 里）会整体丢失。插件改用自研渲染器（`card/markdown.py`）：标题 → `# 标题`、`div`/`markdown` 正文保留（`<text_tag>` 去壳、`<at id=..>` → @名字、`<img>` → [图片]，emoji 短代码保留原样）、原生 `table` → GFM 表格、`note` → `> ` 引用块、`hr`/`button` 忽略。v1 卡片（顶层 `elements` + `markdown` tag）与 v2 / CardKit（`body.elements`）均支持。被引用（回复）卡片以 `> ` Markdown 引用块前置到消息文本，直接收到的卡片消息同样渲染完整 Markdown；渲染失败自动回退父类行为。`@` 名字解析复用 `_get_user_name_by_open_id`（带缓存），应用无 contact 权限或解析失败时回退 `@open_id后4位`。
 - **正则触发规则**：`_on_message` wrapper 在父类处理前完成匹配 —— 命中时改写事件数据（`context` 追加到 `content` 的 text 末尾、必要时注入 `thread_id = message_id`），并以 `ContextVar` 传递命中状态给 `_check_group_mention` 覆写以绕过 @提及 检查。规则带 `chat_ids` 时按消息 `chat_id` 白名单过滤：群不符的规则跳过、不参与命中。父类流程对改写无感知：引用块仍前置正文、slash 命令前缀判断不受末尾追加影响。自动进话题复用父类话题管道（session 按 thread 聚合、`_reply_in_thread` 回复、流式卡片进话题），飞书话题根消息的 `thread_id` 即其自身 `message_id`，后续话题内消息携带相同值，会话天然连续。
 
 ## 已知限制

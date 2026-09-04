@@ -201,7 +201,7 @@ class FeishuPlusPlugin:
         # / reload-triggers（重新加载规则 YAML）。handler 在 channel.py，
         # 经 SlashCommandRegistry 分派到各 workspace（与内置 /daemon
         # 等 control 命令同一机制）。
-        from .channel import feishu_plus_command_handler
+        from .slash_command import feishu_plus_command_handler
 
         api.register_slash_command(
             name="feishu-plus",

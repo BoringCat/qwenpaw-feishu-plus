@@ -23,9 +23,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Awaitable, Callable, Dict, List, Optional
-
-AtResolver = Callable[[str], Awaitable[Optional[str]]]
+import typing as _t
 
 # 收集 / 替换 <at> 标签（id 引号可选，闭合标签内可内嵌名字）。
 _AT_ID_RE = re.compile(r"<at\s+id=[\"']?([A-Za-z0-9_]+)[\"']?")
@@ -44,7 +42,8 @@ _TEXT_LIKE_TAGS = frozenset(
 # 可能嵌套子元素的容器键。
 _CHILD_KEYS = ("elements", "columns", "body", "content", "actions")
 
-AtNames = Dict[str, Optional[str]]
+type AtNames = dict[str, str|None]
+type AtResolver = _t.Callable[[str], _t.Awaitable[str|None]]
 
 
 # ====================================================================
@@ -58,6 +57,14 @@ def quote_lines(text: str) -> str:
         f"> {line}".rstrip() if line.strip() else ">"
         for line in text.splitlines()
     )
+
+def quote_block(text: str) -> str:
+    """把 Markdown 文本转为 markdown 引用块（每行 ``> `` 前缀）。
+
+    空行渲染为单独的 ``>`` 保持引用块连续；块尾补一个空行，使
+    ``text_parts`` 以 ``\\n`` join 后引用块与用户正文之间有空行分隔。
+    """
+    return quote_lines(text) + "\n"
 
 
 def _clean_inline(text: str, at_names: AtNames) -> str:
@@ -86,10 +93,10 @@ def _clean_inline(text: str, at_names: AtNames) -> str:
 # ====================================================================
 
 
-def _render_table(item: Dict[str, Any]) -> Optional[str]:
+def _render_table(item: dict[str, _t.Any]) -> str | None:
     """原生 table 组件 → GFM 表格（无表头且无数据时返回 None）。"""
-    names: List[str] = []
-    headers: List[str] = []
+    names: list[str] = []
+    headers: list[str] = []
     for col in item.get("columns") or []:
         if not isinstance(col, dict):
             continue
@@ -113,7 +120,7 @@ def _render_table(item: Dict[str, Any]) -> Optional[str]:
     return "\n".join(lines) if has_row else None
 
 
-def _render_div(item: Dict[str, Any], at_names: AtNames) -> Optional[str]:
+def _render_div(item: dict[str, _t.Any], at_names: AtNames) -> str|None:
     """div 元素 —— 正文在 text.content（v2 卡片的主体内容位置）。"""
     text = item.get("text")
     if isinstance(text, dict):
@@ -128,7 +135,7 @@ def _render_div(item: Dict[str, Any], at_names: AtNames) -> Optional[str]:
     return None
 
 
-def _render_note(item: Dict[str, Any], at_names: AtNames) -> Optional[str]:
+def _render_note(item: dict[str, _t.Any], at_names: AtNames) -> str|None:
     """note 元素（灰色小字备注）→ ``> `` markdown 引用块。"""
     texts = _render_children(item, at_names)
     if not texts:
@@ -136,9 +143,9 @@ def _render_note(item: Dict[str, Any], at_names: AtNames) -> Optional[str]:
     return quote_lines("\n\n".join(texts))
 
 
-def _render_children(item: Dict[str, Any], at_names: AtNames) -> List[str]:
+def _render_children(item: dict[str, _t.Any], at_names: AtNames) -> list[str]:
     """递归渲染容器键（elements/columns/body/content/actions）中的 list。"""
-    blocks: List[str] = []
+    blocks: list[str] = []
     for key in _CHILD_KEYS:
         children = item.get(key)
         if isinstance(children, list):
@@ -146,12 +153,9 @@ def _render_children(item: Dict[str, Any], at_names: AtNames) -> List[str]:
     return blocks
 
 
-def _render_elements(
-    elements: List[Any],
-    at_names: AtNames,
-) -> List[str]:
+def _render_elements(elements: list[_t.Any], at_names: AtNames) -> list[str]:
     """逐元素渲染为 Markdown 块列表。"""
-    blocks: List[str] = []
+    blocks: list[str] = []
     for item in elements:
         if not isinstance(item, dict):
             continue
@@ -187,9 +191,9 @@ def _render_elements(
 
 
 async def interactive_card_to_markdown(
-    content: Optional[str],
-    at_resolver: Optional[AtResolver] = None,
-) -> Optional[str]:
+    content: str|None,
+    at_resolver: AtResolver|None = None,
+) -> str|None:
     """interactive 卡片 content JSON → Markdown 文本。
 
     Returns:
@@ -211,7 +215,7 @@ async def interactive_card_to_markdown(
     for open_id in _AT_ID_RE.findall(content):
         if open_id in at_names:
             continue
-        name: Optional[str] = None
+        name: str|None = None
         if at_resolver is not None:
             try:
                 name = await at_resolver(open_id)
@@ -219,10 +223,10 @@ async def interactive_card_to_markdown(
                 name = None
         at_names[open_id] = name if isinstance(name, str) else None
 
-    blocks: List[str] = []
+    blocks: list[str] = []
 
     # 标题：v2 header.title 优先，v1 卡片顶层 title 兜底。
-    title: Any = None
+    title = None
     header = data.get("header")
     if isinstance(header, dict):
         title = header.get("title")
