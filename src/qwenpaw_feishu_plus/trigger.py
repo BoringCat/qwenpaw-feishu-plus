@@ -3,8 +3,9 @@
 # ── 触发规则 YAML 的 pydantic 模型 ──
 #
 # ``Trigger.load`` 先用 ``yaml.safe_load`` 读文件，再用
-# ``TriggerRulesFile`` 校验结构。结构 / 类型错误（多余字段、非字符串
-# pattern、非列表 triggers 等）会整份拒绝加载 —— 配置错误应显式暴露，
+# ``TriggerRulesFile`` 校验结构。结构 / 类型错误（多余字段、
+# ``TriggerMatch`` 的 ``regex`` / ``keyword`` 不是恰好一个非空、
+# 非列表 triggers 等）会整份拒绝加载 —— 配置错误应显式暴露，
 # 而不是静默丢弃某条规则；正则本身编译失败仍逐条跳过（字符串在
 # 结构上合法，只是正则非法），见 ``Trigger.load``。
 
@@ -17,7 +18,13 @@ from datetime import datetime
 
 from contextvars import ContextVar, Token
 from pathlib import Path
-from pydantic import BaseModel, ConfigDict, field_validator, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .card.markdown import interactive_card_to_markdown
 
@@ -26,27 +33,50 @@ TRIGGER_YAML_DEFAULT_NAME = "feishu_plus_triggers.yaml"
 
 logger = logging.getLogger(__name__)
 
-class TriggerRule(BaseModel):
-    """单条触发规则：正则 ``pattern``（必填）+ 可选 ``context`` /
-    ``chat_ids``。"""
+class TriggerMatch(BaseModel):
+    """单个匹配条件：``regex`` / ``keyword`` 恰好提供一个。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    pattern: str
-    exclude: str = ""
-    context: str = ""
-    # 限定规则生效的群（chat_id 白名单）；空 = 全部群生效。
-    chat_ids: list[str] = []
+    regex:   str = ""
+    '正则（``re.search`` 语义）；与 keyword 二选一。'
+    keyword: str = ""
+    '字面关键词（子串匹配，正则元字符不生效）；与 regex 二选一。'
 
-    @field_validator("pattern", mode="before")
+    @field_validator('regex', 'keyword', mode="before")
     @classmethod
     def _normalize_pattern(cls, value: _t.Any) -> _t.Any:
-        """去首尾空白；去空后为空则报错（pattern 必填）。"""
-        if isinstance(value, str):
-            value = value.strip()
-            if not value:
-                raise ValueError("pattern must not be empty")
-        return value
+        """去首尾空白；``null`` 视作空串（未提供该匹配方式）。"""
+        if value is None:
+            return ""
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> "TriggerMatch":
+        """regex 与 keyword 恰好一个非空（都缺 / 都给 → 结构错误）。"""
+        if bool(self.regex) == bool(self.keyword):
+            raise ValueError("exactly one of regex / keyword is required")
+        return self
+
+class TriggerRule(BaseModel):
+    """单条触发规则"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    chat_ids: list[str] = []
+    '限定规则生效的群（chat_id 白名单）；空 = 全部群生效。'
+
+    must: list[TriggerMatch]
+    '必须满足的条件'
+    must_not: list[TriggerMatch] = []
+    '必须排除的条件'
+    should: list[TriggerMatch] = []
+    '尽力满足的条件'
+    minimum_should_match: int = 1
+    'should 最小满足个数'
+
+    context: str = ""
+    '追加到上下文的提示词'
 
     @field_validator("context", mode="before")
     @classmethod
@@ -76,6 +106,17 @@ class TriggerRule(BaseModel):
             cleaned.append(item)
         return cleaned
 
+    @model_validator(mode="after")
+    def _require_positive_condition(self) -> "TriggerRule":
+        """must / should 至少一个非空 —— 全空（或仅 must_not）的条件组
+        会命中所有（不含排除词的）消息，必是配置错误，显式报错。"""
+        if not (self.must or self.should):
+            raise ValueError(
+                "at least one of must / should is required "
+                "(must_not-only would match everything)",
+            )
+        return self
+
 class TriggerRulesFile(BaseModel):
     """触发规则 YAML 顶层结构：``triggers`` 规则列表。"""
 
@@ -83,17 +124,69 @@ class TriggerRulesFile(BaseModel):
 
     triggers: list[TriggerRule]
 
-class CompiledTrigger(_t.NamedTuple):
-    """编译好的单条规则：pattern + context + chat_ids（空 = 全部群）。
+class CompiledMatch(_t.NamedTuple):
+    """编译好的单个匹配条件：``regex`` / ``keyword`` 二选一。
 
-    ``Trigger.rules`` 的元素类型；NamedTuple 便于测试按索引断言
-    （[0] pattern / [1] context / [2] chat_ids）。
+    ``CompiledTrigger`` 各条件组的元素类型；``hit`` 统一两种匹配
+    语义 —— 正则 ``re.search`` 命中，关键词为子串包含（字面匹配，
+    正则元字符不生效）。
     """
 
-    pattern: re.Pattern
-    exclude: re.Pattern|None = None
-    context: str = ""
-    chat_ids: tuple[str, ...] = ()
+    regex:   re.Pattern|None = None
+    keyword: str             = ""
+
+    def hit(self, text: str) -> bool:
+        return bool(self.regex.search(text)) if self.regex else self.keyword in text
+
+class CompiledTrigger(_t.NamedTuple):
+    """编译好的单条规则：bool 条件组 + context + chat_ids（空 = 全部群）。
+
+    ``Trigger.rules`` 的元素类型。命中语义（``Trigger.match``）：
+    ``must`` 全部 hit、``must_not`` 全部不 hit、``should`` 至少
+    ``minimum_should_match`` 个 hit（``should`` 为空时无该约束）。
+    """
+
+    must:      tuple[CompiledMatch, ...] = ()
+    must_not:  tuple[CompiledMatch, ...] = ()
+    should:    tuple[CompiledMatch, ...] = ()
+    minimum_should_match: int = 1
+    context:   str = ""
+    chat_ids:  tuple[str, ...] = ()
+
+def _compile_rule(idx: int, rule: TriggerRule) -> CompiledTrigger|None:
+    """把校验过的规则编译成 ``CompiledTrigger``；任一正则非法返回 None。
+
+    正则编译失败只跳过本条规则（字符串在结构上合法，只是正则
+    非法），不影响其余条目 —— 见 ``Trigger.load``。
+    """
+    groups: dict[str, tuple[CompiledMatch, ...]] = {}
+    for section in ("must", "must_not", "should"):
+        compiled = []
+        for m in getattr(rule, section):
+            try:
+                compiled.append(CompiledMatch(
+                    regex   = re.compile(m.regex) if m.regex else None,
+                    keyword = m.keyword,
+                ))
+            except re.error as exc:
+                logger.warning(
+                    "feishu-plus trigger yaml: rule #%d invalid regex in "
+                    "%s %r (%s), rule skipped",
+                    idx,
+                    section,
+                    m.regex,
+                    exc,
+                )
+                return None
+        groups[section] = tuple(compiled)
+    return CompiledTrigger(
+        must      = groups["must"],
+        must_not  = groups["must_not"],
+        should    = groups["should"],
+        minimum_should_match = rule.minimum_should_match,
+        context   = rule.context,
+        chat_ids  = tuple(rule.chat_ids),
+    )
 
 class TriggerContext():
     matched: ContextVar[bool] = ContextVar(
@@ -116,7 +209,7 @@ class Trigger():
         path:str|Path               = '',
         auto_thread:bool            = False,
     ):
-        # ── 正则触发规则（from_config 覆盖；见 Trigger.load） ──
+        # ── 触发规则（from_config 覆盖；见 Trigger.load） ──
         self.__rules       = rules
         self.__path        = Path(path) if path else None
         self.__auto_thread = auto_thread
@@ -146,23 +239,26 @@ class Trigger():
         return self.__rules
 
     # ------------------------------------------------------------------
-    # 正则触发规则 —— YAML 加载 / 匹配 / mention 绕过 / 自动进话题
+    # 触发规则 —— YAML 加载 / 匹配 / mention 绕过 / 自动进话题
     # ------------------------------------------------------------------
 
     def load(self) -> tuple[bool, int]:
         """加载触发规则 YAML（顶层 ``triggers:`` 列表）。
 
-        文件结构由 ``TriggerRulesFile`` / ``TriggerRule`` 两个 pydantic
-        模型校验：``triggers`` 为规则列表，每条 ``pattern``（正则，
-        ``re.search`` 语义）为必填非空字符串、``context`` 与 ``chat_ids``
-        可选（后者为群 chat_id 白名单，空 = 全部群生效），多余字段与
-        类型错误整份置空。正则编译失败逐条跳过并告警，不影响其余条目。
-        文件不存在 / 解析失败 / 结构不符只记日志并置空规则，不抛异常
-        —— 触发规则是增强能力，不应因配置问题阻断渠道启动。
+        文件结构由 ``TriggerRulesFile`` / ``TriggerRule`` /
+        ``TriggerMatch`` 三个 pydantic 模型校验：``triggers`` 为规则
+        列表，每条 ``must``（必填）/ ``must_not`` / ``should`` 为匹配
+        条件组，每条条件 ``regex``（``re.search`` 语义）或 ``keyword``
+        （字面子串）恰好提供一个；``minimum_should_match`` /
+        ``context`` / ``chat_ids`` 可选（末者为群 chat_id 白名单，
+        空 = 全部群生效），多余字段与类型错误整份置空。正则编译
+        失败逐条跳过并告警，不影响其余条目。文件不存在 / 解析失败 /
+        结构不符只记日志并置空规则，不抛异常 —— 触发规则是增强
+        能力，不应因配置问题阻断渠道启动。
 
         调用副作用（供 ``/feishu-plus`` 命令反馈）：失败时置
         ``self.__load_error`` 为人类可读原因（成功 / 默认文件缺失
-        则保持空串），被跳过的非法正则条数写入 ``self.__skipped``。
+        则保持空串），被跳过的含非法正则规则条数写入 ``self.__skipped``。
         """
         rules:list[CompiledTrigger] = []
         if not self.__path:
@@ -207,38 +303,11 @@ class Trigger():
             return False, 0
         skipped = 0
         for idx, rule in enumerate(rules_file.triggers):
-            try:
-                pattern = re.compile(rule.pattern)
-            except re.error as exc:
+            compiled = _compile_rule(idx, rule)
+            if compiled is None:
                 skipped += 1
-                logger.warning(
-                    "feishu-plus trigger yaml: rule #%d invalid regex "
-                    "%r (%s), skipped",
-                    idx,
-                    rule.pattern,
-                    exc,
-                )
                 continue
-            try:
-                exclude_pattern = re.compile(rule.exclude)\
-                    if rule.exclude\
-                    else None
-            except re.error as exc:
-                skipped += 1
-                logger.warning(
-                    "feishu-plus trigger yaml: rule #%d invalid exclude regex "
-                    "%r (%s), skipped",
-                    idx,
-                    rule.pattern,
-                    exc,
-                )
-                continue
-            rules.append(
-                CompiledTrigger(
-                    pattern, exclude_pattern,
-                    rule.context, tuple(rule.chat_ids)
-                ),
-            )
+            rules.append(compiled)
         logger.info(
             "feishu-plus trigger rules loaded: %d from %s",
             len(rules),
@@ -252,9 +321,10 @@ class Trigger():
     def describe_triggers(self) -> str:
         """生成当前触发规则配置的人类可读文本（show-triggers）。
 
-        列出规则文件路径、相关触发开关与逐条生效规则（pattern /
-        context / chat_ids 白名单）。规则为空时给出原因（文件缺失 /
-        加载失败 / 文件中没有规则），便于运维定位。
+        列出规则文件路径、相关触发开关与逐条生效规则（must /
+        must_not / should 条件组 / context / chat_ids 白名单）。规则
+        为空时给出原因（文件缺失 / 加载失败 / 文件中没有规则），
+        便于运维定位。
         """
         lines = [
             f"触发规则：生效 {len(self.__rules)} 条",
@@ -275,16 +345,33 @@ class Trigger():
                 else "群白名单: " + "、".join(rule.chat_ids)
             )
             lines.append("")
-            lines.append(f"{idx}. pattern: `{rule.pattern.pattern}`")
-            if rule.exclude:
-                lines.append(f"   exclude: `{rule.exclude.pattern}`")
+            # 编号只落在首个非空条件组上；后续组与属性行缩进对齐。
+            head = f"{idx}."
+            for section, label in (
+                ("must", "must（须全部命中）"),
+                ("must_not", "must_not（须全部不命中）"),
+                (
+                    "should",
+                    f"should（至少命中 {rule.minimum_should_match} 个）",
+                ),
+            ):
+                matches = getattr(rule, section)
+                if not matches:
+                    continue
+                lines.append(f"{head} {label}")
+                head = "  "
+                for m in matches:
+                    if m.regex:
+                        lines.append(f"     - regex: `{m.regex.pattern}`")
+                    else:
+                        lines.append(f"     - keyword: `{m.keyword}`")
             if rule.context:
                 lines.append(f"   context: {rule.context}")
             lines.append(f"   生效范围: {scope}")
         if self.__skipped:
             lines.append(
                 ""
-                f"（本次加载 {self.__skipped} 条非法正则被跳过）",
+                f"（本次加载 {self.__skipped} 条规则因正则非法被跳过）",
             )
         return "\n".join(lines)
 
@@ -303,16 +390,17 @@ class Trigger():
             )
         head = f"触发规则已重新加载，生效 {count} 条。"
         if self.__skipped > 0:
-            head += f"（其中 {self.__skipped} 条正则非法被跳过，详见日志）"
+            head += f"（其中 {self.__skipped} 条规则因正则非法被跳过，详见日志）"
         return f"{head}\n\n{self.describe_triggers()}"
 
     async def match(self, message: _t.Any) -> tuple[bool, str]:
         """群 text / interactive 消息正文匹配触发规则。
 
-        返回 ``(matched, context)``：第一条 ``pattern.search`` 命中且
-        群 chat_id 在规则 ``chat_ids`` 白名单内（或规则不限群）的
-        context（未配置则为空串）；未命中 / 非群 / 正文解析失败均
-        返回 ``(False, "")``。
+        返回 ``(matched, context)``：第一条条件组满足（``must`` 全部
+        命中、``must_not`` 全部不命中、``should`` 至少
+        ``minimum_should_match`` 个命中）且群 chat_id 在规则
+        ``chat_ids`` 白名单内（或规则不限群）的 context（未配置则为
+        空串）；未命中 / 非群 / 正文解析失败均返回 ``(False, "")``。
 
         text 消息取 content 的 ``text`` 字段；interactive 卡片经
         ``interactive_card_to_markdown`` 渲染成 Markdown 后匹配
@@ -347,10 +435,13 @@ class Trigger():
             # 规则限定群且当前群不在白名单 → 跳过该规则，继续找下一条。
             if rule.chat_ids and chat_id not in rule.chat_ids:
                 continue
-            if not rule.pattern.search(text):
+            if not all(m.hit(text) for m in rule.must):
                 continue
-            if not rule.exclude:
-                return True, rule.context
-            elif not rule.exclude.search(text):
-                return True, rule.context
+            if any(m.hit(text) for m in rule.must_not):
+                continue
+            if rule.should and sum(
+                m.hit(text) for m in rule.should
+            ) < rule.minimum_should_match:
+                continue
+            return True, rule.context
         return False, ""

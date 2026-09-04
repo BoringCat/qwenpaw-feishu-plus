@@ -19,14 +19,17 @@ registry 跳过）。全部收发 / WebSocket / CardKit / 媒体能力继承自�
    ``div`` 的正文（在 ``text.content`` 键）整体丢失；本类对直接收到的
    interactive 消息与被引用（quoted）卡片都改为完整 Markdown 渲染，
    quoted 时以 ``> `` 引用块前置。
-5. 正则触发规则（YAML 文件配置）—— 群消息正文命中任一正则时绕过
-   ``require_mention`` 的 @提及 检查；规则可携带 ``context``（命中时
-   追加到消息正文末尾一并发送给 AI）与 ``chat_ids``（按群 chat_id
-   白名单限定，缺省全部群生效），见 ``Trigger.load``。匹配对象为
+5. 触发规则（YAML 文件配置）—— 群消息正文满足规则的 bool 条件组
+   （``must`` 全部命中、``must_not`` 全部不命中、``should`` 至少
+   ``minimum_should_match`` 个命中；每条条件 ``regex`` 正则或
+   ``keyword`` 字面子串二选一）时绕过 ``require_mention`` 的 @提及
+   检查；规则可携带 ``context``（命中时追加到消息正文末尾一并发送
+   给 AI）与 ``chat_ids``（按群 chat_id 白名单限定，缺省全部群生效），
+   见 ``Trigger.load``。匹配对象为
    text 消息正文与 interactive 卡片渲染出的 Markdown（卡片无 text
    字段可改写，``context`` 经 ``_trigger_context.context`` 传递、由
    ``_parse_message_content`` 在渲染末尾追加）。
-6. 自动进话题 —— 正则触发且消息不在话题中时，向事件注入
+6. 自动进话题 —— 触发规则命中且消息不在话题中时，向事件注入
    ``thread_id = message_id``，父类话题管道（session 聚合 / 话题回复 /
    流式卡片）全部自动复用（见 ``_on_message``）。
 7. ``/feishu-plus`` 管理命令 —— 经 ``plugin.py`` 以
@@ -100,7 +103,7 @@ class FeishuPlusChannel(FeishuChannel):
             "feishu-plus: tool_guard render+handle overridden (thread-aware)",
         )
 
-        # ── 正则触发规则（from_config 覆盖；见 Trigger.load） ──
+        # ── 触发规则（from_config 覆盖；见 Trigger.load） ──
         self._trigger = Trigger()
 
     # ------------------------------------------------------------------
@@ -187,7 +190,7 @@ class FeishuPlusChannel(FeishuChannel):
         self,
         data: 'P2ImMessageReceiveV1',
     ) -> None:
-        """正则触发包装：命中时注入话题 + 追加 context，再走父类。
+        """触发规则命中时注入话题 + 追加 context，再走父类。
 
         命中后做三件事（全部通过改写 event 数据完成，父类流程无感知）：
 
@@ -277,7 +280,7 @@ class FeishuPlusChannel(FeishuChannel):
         is_group: bool,
         meta: dict[str, _t.Any],
     ) -> bool:
-        """正则命中时绕过 @提及 检查，其余透传父类。
+        """触发规则命中时绕过 @提及 检查，其余透传父类。
 
         ``_TRIGGER_MATCHED`` 仅在 ``_on_message`` wrapper 内群消息
         命中时置位（同一 task 直接 await，无并发串扰），p2p 路径
@@ -342,7 +345,7 @@ class FeishuPlusChannel(FeishuChannel):
         ``_process_quoted_message``）都受益。渲染失败（JSON 损坏等）
         回退父类单行压平。
 
-        正则触发命中（interactive）时，``_on_message`` 经
+        触发规则命中（interactive）时，``_on_message`` 经
         ``_trigger_context.context`` 传入规则 context —— 在渲染 Markdown 末尾
         追加一行；``message_id`` 与触发消息一致才追加（quoted 路径
         传 parent_id，不会误吞）。

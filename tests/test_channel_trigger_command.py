@@ -20,7 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from qwenpaw_feishu_plus.channel import FeishuPlusChannel, Trigger
-from qwenpaw_feishu_plus.trigger import CompiledTrigger
+from qwenpaw_feishu_plus.trigger import CompiledMatch, CompiledTrigger
 
 from qwenpaw_feishu_plus.slash_command import (
     _TRIGGER_COMMAND_USAGE,
@@ -29,17 +29,24 @@ from qwenpaw_feishu_plus.slash_command import (
 
 _TRIGGER_PATH_NAME = "feishu_plus_triggers.yaml"
 
+# 常用 YAML 片段：单条 must-regex 规则。
+_YAML_RULE_ALERT = (
+    "triggers:\n"
+    "  - must:\n"
+    '      - regex: "^告警"\n'
+)
+
 
 def _rule(
-    pattern: str,
+    must: str,
     context: str = "",
     chat_ids: tuple[str, ...] = (),
 ) -> CompiledTrigger:
-    """构造一条编译好的触发规则。"""
+    """构造一条以单正则 must 为条件的编译规则。"""
     return CompiledTrigger(
-        pattern=re.compile(pattern),
-        context=context,
-        chat_ids=chat_ids,
+        must      = (CompiledMatch(regex=re.compile(must)),),
+        context   = context,
+        chat_ids  = chat_ids,
     )
 
 
@@ -89,13 +96,40 @@ def test_describe_triggers_lists_rules(tmp_path: Path) -> None:
     assert "生效 2 条" in text
     assert str(tmp_path / _TRIGGER_PATH_NAME) in text
     assert "触发到话题: 关" in text
-    # 规则 1：context 与群白名单展示。
-    assert "^告警" in text
+    # 规则 1：条件组标题 + context 与群白名单展示。
+    assert "must（须全部命中）" in text
+    assert "regex: `^告警`" in text
     assert "运维告警场景" in text
     assert "群白名单: oc_a、oc_b" in text
     # 规则 2：纯触发、不限群。
     assert "小助手" in text
     assert "全部群" in text
+
+
+def test_describe_triggers_lists_bool_groups(tmp_path: Path) -> None:
+    # must_not / should 组与 minimum_should_match 一并展示。
+    ch = _make_channel(
+        path=str(tmp_path / _TRIGGER_PATH_NAME),
+        rules=[
+            CompiledTrigger(
+                must      = (CompiledMatch(keyword="告警"),),
+                must_not  = (CompiledMatch(regex=re.compile("^<提醒>")),),
+                should    = (
+                    CompiledMatch(regex=re.compile("P[012]")),
+                    CompiledMatch(keyword="CPU"),
+                ),
+                minimum_should_match = 2,
+                context   = "值班",
+            ),
+        ],
+    )
+    text = ch.describe_triggers()
+
+    assert "must_not（须全部不命中）" in text
+    assert "regex: `^<提醒>`" in text
+    assert "should（至少命中 2 个）" in text
+    assert "keyword: `告警`" in text
+    assert "keyword: `CPU`" in text
 
 
 def test_describe_triggers_reports_auto_thread(tmp_path: Path) -> None:
@@ -130,9 +164,13 @@ def test_describe_triggers_skipped_note(tmp_path: Path) -> None:
     _load_yaml(
         ch,
         tmp_path / _TRIGGER_PATH_NAME,
-        'triggers:\n  - pattern: "^告警"\n  - pattern: "([unclosed"\n',
+        "triggers:\n"
+        "  - must:\n"
+        '      - regex: "^告警"\n'
+        "  - must:\n"
+        '      - regex: "([unclosed"\n',
     )
-    assert "本次加载 1 条非法正则被跳过" in ch.describe_triggers()
+    assert "本次加载 1 条规则因正则非法被跳过" in ch.describe_triggers()
 
 
 # ====================================================================
@@ -143,12 +181,16 @@ def test_describe_triggers_skipped_note(tmp_path: Path) -> None:
 def test_reload_triggers_picks_up_file_edit(tmp_path: Path) -> None:
     yaml_file = tmp_path / _TRIGGER_PATH_NAME
     ch = _make_channel(path=str(yaml_file))
-    _load_yaml(ch, yaml_file, 'triggers:\n  - pattern: "^告警"\n')
+    _load_yaml(ch, yaml_file, _YAML_RULE_ALERT)
     assert len(ch._trigger.rules) == 1
 
     # 修改文件后 reload：新规则免重启生效。
     yaml_file.write_text(
-        'triggers:\n  - pattern: "^告警"\n  - pattern: "P[012]"\n',
+        "triggers:\n"
+        "  - must:\n"
+        '      - regex: "^告警"\n'
+        "  - must:\n"
+        '      - regex: "P[012]"\n',
         encoding="utf-8",
     )
     text = ch.reload_triggers()
@@ -198,7 +240,11 @@ def test_reload_triggers_reports_skipped(tmp_path: Path) -> None:
     _load_yaml(
         ch,
         yaml_file,
-        'triggers:\n  - pattern: "^告警"\n  - pattern: "([unclosed"\n',
+        "triggers:\n"
+        "  - must:\n"
+        '      - regex: "^告警"\n'
+        "  - must:\n"
+        '      - regex: "([unclosed"\n',
     )
     assert len(ch._trigger.rules) == 1
 
@@ -206,7 +252,7 @@ def test_reload_triggers_reports_skipped(tmp_path: Path) -> None:
 
     # 文件整体合法，坏正则条目被跳过并明确提示。
     assert "生效 1 条" in text
-    assert "1 条正则非法被跳过" in text
+    assert "1 条规则因正则非法被跳过" in text
 
 
 def test_reload_triggers_no_path() -> None:
@@ -251,14 +297,14 @@ async def test_handler_show_triggers_routes() -> None:
 
     text = _msg_text(msg)
     assert "生效 1 条" in text
-    assert "^告警" in text
+    assert "regex: `^告警`" in text
     assert "值班口径" in text
 
 
 async def test_handler_reload_triggers_routes(tmp_path: Path) -> None:
     yaml_file = tmp_path / _TRIGGER_PATH_NAME
     ch = _make_channel(path=str(yaml_file))
-    _load_yaml(ch, yaml_file, 'triggers:\n  - pattern: "^告警"\n')
+    _load_yaml(ch, yaml_file, _YAML_RULE_ALERT)
     msg = await feishu_plus_command_handler(_ctx_for(ch), "reload-triggers")
 
     text = _msg_text(msg)

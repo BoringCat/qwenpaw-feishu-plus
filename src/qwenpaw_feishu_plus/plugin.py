@@ -26,7 +26,7 @@ class FeishuPlusPlugin:
                 "zh": "飞书+",
                 "en": "Feishu Plus",
             },
-            description="继承内置飞书渠道，修复话题内审批卡片发送路径，尝试话题内流式输出（以 / 开头的命令消息除外，自动回退纯文本），并以 / 开头的命令消息跳过引用内容获取；支持 YAML 正则触发规则（免 @提及、可追加场景上下文）与触发自动进话题。需停用内置「飞书」渠道。",
+            description="继承内置飞书渠道，修复话题内审批卡片发送路径，尝试话题内流式输出（以 / 开头的命令消息除外，自动回退纯文本），并以 / 开头的命令消息跳过引用内容获取；支持 YAML 触发规则（must/must_not/should 条件组，免 @提及、可追加场景上下文）与触发自动进话题。需停用内置「飞书」渠道。",
             icon="https://gw.alicdn.com/imgextra/i4/O1CN01jsn08m225euyUoaFN_!!6000000007069-2-tps-400-400.png",
             config_fields=[
                 {
@@ -183,12 +183,12 @@ class FeishuPlusPlugin:
                     "default": False,
                     "help": {
                         "zh": (
-                            "正则触发且消息不在话题中时，机器人回复自动"
+                            "触发规则命中且消息不在话题中时，机器人回复自动"
                             "进入以该消息为根的话题；话题内后续消息共享"
                             "同一会话上下文"
                         ),
                         "en": (
-                            "When a regex trigger fires on a message "
+                            "When a trigger rule fires on a message "
                             "outside any topic thread, the bot reply "
                             "automatically goes into a thread rooted at "
                             "that message"
@@ -204,13 +204,23 @@ class FeishuPlusPlugin:
         from .slash_command import feishu_plus_command_handler
 
         api.register_slash_command(
-            name="feishu-plus",
-            handler=feishu_plus_command_handler,
-            category="plugin",
-            help_text=(
+            name      = "feishu-plus",
+            handler   = feishu_plus_command_handler,
+            category  = "plugin",
+            help_text = (
                 "飞书+ 触发规则管理："
                 "/feishu-plus show-triggers 查看生效规则；"
                 "/feishu-plus reload-triggers 重新加载规则 YAML"
+            ),
+        )
+        api.register_slash_command(
+            name      = "feishu_plus",
+            handler   = feishu_plus_command_handler,
+            category  = "plugin",
+            help_text = (
+                "飞书+ 触发规则管理："
+                "/feishu_plus show-triggers 查看生效规则；"
+                "/feishu_plus reload-triggers 重新加载规则 YAML"
             ),
         )
         logger.info("✓ Feishu Plus channel registered")
