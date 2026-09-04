@@ -1,6 +1,6 @@
 [project]
 name = "qwenpaw-feishu-plus"
-version = "1.2.3"
+version = "1.2.4"
 description = "对QwenPaw平台飞书频道的增强插件"
 readme = "README.md"
 authors = [

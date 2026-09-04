@@ -1,7 +1,7 @@
 {
   "id": "feishu-plus",
   "name": "Feishu Plus",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "type": "channel",
   "description": "飞书渠道增强：话题内审批卡片 + 话题内流式输出（/ 命令除外，回退纯文本）+ 命令消息跳过引用获取 + interactive 卡片结构化 Markdown 渲染（quoted 引用块 / 直接消息）+ YAML 正则触发规则（免 @提及、context 追加正文、按群 chat_id 白名单限定）+ 触发自动进话题 + /feishu-plus 管理命令（show-triggers 查看生效触发规则 / reload-triggers 重新加载规则 YAML）。继承内置 FeishuChannel。",
   "author": "boringcat",

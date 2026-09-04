@@ -33,6 +33,7 @@ class TriggerRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     pattern: str
+    exclude: str = ""
     context: str = ""
     # 限定规则生效的群（chat_id 白名单）；空 = 全部群生效。
     chat_ids: list[str] = []
@@ -90,6 +91,7 @@ class CompiledTrigger(_t.NamedTuple):
     """
 
     pattern: re.Pattern
+    exclude: re.Pattern|None = None
     context: str = ""
     chat_ids: tuple[str, ...] = ()
 
@@ -217,8 +219,25 @@ class Trigger():
                     exc,
                 )
                 continue
+            try:
+                exclude_pattern = re.compile(rule.exclude)\
+                    if rule.exclude\
+                    else None
+            except re.error as exc:
+                skipped += 1
+                logger.warning(
+                    "feishu-plus trigger yaml: rule #%d invalid exclude regex "
+                    "%r (%s), skipped",
+                    idx,
+                    rule.pattern,
+                    exc,
+                )
+                continue
             rules.append(
-                CompiledTrigger(pattern, rule.context, tuple(rule.chat_ids)),
+                CompiledTrigger(
+                    pattern, exclude_pattern,
+                    rule.context, tuple(rule.chat_ids)
+                ),
             )
         logger.info(
             "feishu-plus trigger rules loaded: %d from %s",
@@ -256,7 +275,9 @@ class Trigger():
                 else "群白名单: " + "、".join(rule.chat_ids)
             )
             lines.append("")
-            lines.append(f"{idx}. pattern: {rule.pattern.pattern}")
+            lines.append(f"{idx}. pattern: `{rule.pattern.pattern}`")
+            if rule.exclude:
+                lines.append(f"   exclude: `{rule.exclude.pattern}`")
             if rule.context:
                 lines.append(f"   context: {rule.context}")
             lines.append(f"   生效范围: {scope}")
@@ -326,6 +347,10 @@ class Trigger():
             # 规则限定群且当前群不在白名单 → 跳过该规则，继续找下一条。
             if rule.chat_ids and chat_id not in rule.chat_ids:
                 continue
-            if rule.pattern.search(text):
+            if not rule.pattern.search(text):
+                continue
+            if not rule.exclude:
+                return True, rule.context
+            elif not rule.exclude.search(text):
                 return True, rule.context
         return False, ""
