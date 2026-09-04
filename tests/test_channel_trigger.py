@@ -17,10 +17,10 @@ from lark_oapi.api.im.v1.model.event_message import EventMessage
 
 from qwenpaw_feishu_plus.channel import (
     FeishuPlusChannel,
-    _TRIGGER_MATCHED,
-    Trigger,
 )
-from qwenpaw_feishu_plus.models import (
+from qwenpaw_feishu_plus.trigger import (
+    Trigger,
+    TriggerContext,
     CompiledTrigger
 )
 
@@ -70,6 +70,40 @@ def _text_message(
             "message_type": message_type,
             "thread_id": thread_id,
             "content": json.dumps({"text": text}, ensure_ascii=False),
+        },
+    )
+
+
+def _alert_card(title: str = "告警标题", body: str = "P0 CPU 告警") -> dict:
+    """v2 结构的最小告警卡片（header.title + body.elements div 正文）。"""
+    return {
+        "schema": "2.0",
+        "header": {"title": {"content": title}},
+        "body": {
+            "elements": [
+                {"tag": "div", "text": {"content": body}},
+            ],
+        },
+    }
+
+
+def _card_message(
+    card: dict,
+    *,
+    chat_type: str = "group",
+    thread_id: str = "",
+    message_id: str = _MSG_ID,
+    chat_id: str = _CHAT_ID,
+) -> EventMessage:
+    """构造 group interactive 事件消息（content 为卡片 JSON）。"""
+    return EventMessage(
+        d={
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "message_type": "interactive",
+            "thread_id": thread_id,
+            "content": json.dumps(card, ensure_ascii=False),
         },
     )
 
@@ -309,7 +343,7 @@ def test_load_trigger_yaml_chat_ids_scalar_rejected(tmp_path: Path) -> None:
 # ====================================================================
 
 
-def test_trigger_match_literal_and_first_hit_context() -> None:
+async def test_trigger_match_literal_and_first_hit_context() -> None:
     ch = _make_channel(
         [
             (r"^小助手", "场景A"),
@@ -318,51 +352,137 @@ def test_trigger_match_literal_and_first_hit_context() -> None:
         ],
     )
     # 多规则命中：取第一条命中的 context。
-    matched, ctx = ch._trigger.match(_text_message("P1 告警了"))
+    matched, ctx = await ch._trigger.match(_text_message("P1 告警了"))
     assert matched is True
     assert ctx == "场景B"
 
-    matched, ctx = ch._trigger.match(_text_message("无关内容"))
+    matched, ctx = await ch._trigger.match(_text_message("无关内容"))
     assert matched is False
     assert ctx == ""
 
 
-def test_trigger_match_anchor_and_case() -> None:
+async def test_trigger_match_anchor_and_case() -> None:
     ch = _make_channel([(r"^小助手", "ctx"), ((r"(?i)\bHELP\b"), "")])
 
     # ^ 锚定：不在行首不命中。
-    assert ch._trigger.match(_text_message("帮我叫 小助手"))[0] is False
-    assert ch._trigger.match(_text_message("小助手 帮我"))[0] is True
+    assert (
+        await ch._trigger.match(_text_message("帮我叫 小助手"))
+    )[0] is False
+    assert (
+        await ch._trigger.match(_text_message("小助手 帮我"))
+    )[0] is True
     # (?i) 大小写不敏感。
-    assert ch._trigger.match(_text_message("help me"))[0] is True
+    assert (
+        await ch._trigger.match(_text_message("help me"))
+    )[0] is True
 
 
-def test_trigger_match_not_group_or_not_text() -> None:
+async def test_trigger_match_not_group_or_unsupported_type() -> None:
     ch = _make_channel([(r"告警", "ctx")])
 
     # p2p 不参与触发（私聊本就必达）。
-    assert ch._trigger.match(_text_message("告警", chat_type="p2p"))[
-        0
-    ] is False
-    # 非 text 类型不匹配。
-    assert ch._trigger.match(
-        _text_message("告警", message_type="post"),
+    assert (
+        await ch._trigger.match(_text_message("告警", chat_type="p2p"))
+    )[0] is False
+    # post / 媒体等其余类型仍不匹配（结构各异，不猜）。
+    assert (
+        await ch._trigger.match(_text_message("告警", message_type="post"))
     )[0] is False
 
 
-def test_trigger_match_empty_rules() -> None:
+# ====================================================================
+# _trigger.match —— interactive 卡片
+# ====================================================================
+
+@pytest.mark.asyncio
+async def test_trigger_match_interactive_card() -> None:
+    # 卡片渲染为 Markdown（# 标题 + div 正文）后匹配，语义与 text 一致。
+    ch = _make_channel([(r"P0", "值班场景")])
+    matched, ctx = (await ch._trigger.match(_card_message(_alert_card())))
+    assert matched is True
+    assert ctx == "值班场景"
+
+    matched, ctx = (await ch._trigger.match(
+        _card_message(_alert_card(title="日报", body="今日无事")),
+    ))
+    assert matched is False
+    assert ctx == ""
+
+
+@pytest.mark.asyncio
+async def test_trigger_match_interactive_title_anchor() -> None:
+    # ^ 锚定针对渲染后的 Markdown：标题渲染为 "# 告警标题"，
+    # ^告警 不命中、^# 命中（正则要按渲染文本写）。
+    ch = _make_channel([(r"^告警", "")])
+    assert (
+        await ch._trigger.match(_card_message(_alert_card()))
+    )[0] is False
+
+    ch = _make_channel([(r"^# 告警", "")])
+    assert (
+        await ch._trigger.match(_card_message(_alert_card()))
+    )[0] is True
+
+
+@pytest.mark.asyncio
+async def test_trigger_match_interactive_chat_ids_whitelist() -> None:
+    # 卡片消息同样受 chat_ids 白名单约束。
+    ch = _make_channel([(r"P0", "ctx", ("oc_a",))])
+    assert (await ch._trigger.match(
+        _card_message(_alert_card(), chat_id="oc_a"),
+    )) == (True, "ctx")
+    assert (await ch._trigger.match(
+        _card_message(_alert_card(), chat_id="oc_b"),
+    )) == (False, "")
+
+
+@pytest.mark.asyncio
+async def test_trigger_match_interactive_p2p() -> None:
+    ch = _make_channel([(r"P0", "")])
+    assert (await ch._trigger.match(
+        _card_message(_alert_card(), chat_type="p2p"),
+    ))[0] is False
+
+
+@pytest.mark.asyncio
+async def test_trigger_match_interactive_bad_json() -> None:
+    ch = _make_channel([(r"P0", "")])
+    msg = _card_message(_alert_card())
+    msg.content = "not json"
+    assert (await ch._trigger.match(msg)) == (False, "")
+
+
+@pytest.mark.asyncio
+async def test_trigger_match_interactive_textless_card() -> None:
+    # 渲染为空（无标题、无可渲染正文元素）的卡片不参与匹配。
+    ch = _make_channel([(r"P0", "")])
+    card = {
+        "schema": "2.0",
+        "body": {"elements": [{"tag": "hr"}]},
+    }
+    assert (
+        await ch._trigger.match(_card_message(card))
+    ) == (False, "")
+
+
+@pytest.mark.asyncio
+async def test_trigger_match_empty_rules() -> None:
     ch = _make_channel([])
-    assert ch._trigger.match(_text_message("告警")) == (False, "")
+    assert (
+        await ch._trigger.match(_text_message("告警"))
+    ) == (False, "")
 
 
-def test_trigger_match_bad_content_json() -> None:
+@pytest.mark.asyncio
+async def test_trigger_match_bad_content_json() -> None:
     ch = _make_channel([(r"告警", "")])
     msg = _text_message("告警")
     msg.content = "not json"
-    assert ch._trigger.match(msg) == (False, "")
+    assert (await ch._trigger.match(msg)) == (False, "")
 
 
-def test_trigger_match_chat_ids_whitelist() -> None:
+@pytest.mark.asyncio
+async def test_trigger_match_chat_ids_whitelist() -> None:
     # 规则1 限定 _CHAT_ID；规则2 不限群 —— 取第一条可命中的规则。
     ch = _make_channel(
         [
@@ -371,33 +491,39 @@ def test_trigger_match_chat_ids_whitelist() -> None:
         ],
     )
     # 白名单内的群：规则1 命中。
-    assert ch._trigger.match(_text_message("告警了")) == (True, "场景A")
+    assert (
+        await ch._trigger.match(_text_message("告警了"))
+    ) == (True, "场景A")
     # 白名单之外的群：跳过规则1，规则2 命中。
-    assert ch._trigger.match(
+    assert (await ch._trigger.match(
         _text_message("告警了", chat_id="oc_other"),
-    ) == (True, "场景B")
+    )) == (True, "场景B")
 
 
-def test_trigger_match_chat_ids_no_match_outside() -> None:
+@pytest.mark.asyncio
+async def test_trigger_match_chat_ids_no_match_outside() -> None:
     ch = _make_channel([(r"告警", "ctx", (_CHAT_ID,))])
-    assert ch._trigger.match(_text_message("告警")) == (True, "ctx")
-    assert ch._trigger.match(
+    assert (await ch._trigger.match(
+        _text_message("告警")
+    )) == (True, "ctx")
+    assert (await ch._trigger.match(
         _text_message("告警", chat_id="oc_other"),
-    ) == (False, "")
+    )) == (False, "")
 
 
-def test_trigger_match_chat_ids_multi_group() -> None:
+@pytest.mark.asyncio
+async def test_trigger_match_chat_ids_multi_group() -> None:
     ch = _make_channel([(r"告警", "ctx", ("oc_a", "oc_b"))])
-    assert ch._trigger.match(_text_message("告警", chat_id="oc_b")) == (
-        True,
-        "ctx",
-    )
-    assert ch._trigger.match(
+    assert (await ch._trigger.match(
+        _text_message("告警", chat_id="oc_b")
+    )) == (True, "ctx")
+    assert (await ch._trigger.match(
         _text_message("告警", chat_id="oc_c"),
-    ) == (False, "")
+    )) == (False, "")
 
 
-def test_trigger_match_chat_ids_blank_message_chat() -> None:
+@pytest.mark.asyncio
+async def test_trigger_match_chat_ids_blank_message_chat() -> None:
     # 规则限定群但消息缺 chat_id：不命中；不限群的规则仍命中。
     ch = _make_channel(
         [
@@ -405,9 +531,9 @@ def test_trigger_match_chat_ids_blank_message_chat() -> None:
             (r"告警", "ctxB"),
         ],
     )
-    assert ch._trigger.match(
+    assert (await ch._trigger.match(
         _text_message("告警", chat_id=""),
-    ) == (True, "ctxB")
+    )) == (True, "ctxB")
 
 
 # ====================================================================
@@ -422,11 +548,11 @@ def test_check_group_mention_trigger_bypass() -> None:
     assert ch._check_group_mention(True, {}) is False
 
     # 命中（ContextVar）：绕过 @提及 检查。
-    token = _TRIGGER_MATCHED.set(True)
+    token = ch._trigger.context.matched.set(True)
     try:
         assert ch._check_group_mention(True, {}) is True
     finally:
-        _TRIGGER_MATCHED.reset(token)
+        ch._trigger.context.matched.reset(token)
 
     # 复位后恢复父类行为。
     assert ch._check_group_mention(True, {}) is False
@@ -447,101 +573,101 @@ def _stub_super(monkeypatch: pytest.MonkeyPatch) -> dict:
     """把父类 _on_message 换成记录型 stub，返回调用记录。"""
     from qwenpaw.app.channels.feishu.channel import FeishuChannel
 
-    record: dict = {"calls": 0, "flag": None, "data": None}
+    record: dict = {
+        "calls": 0,
+        "flag": None,
+        "context": None,
+        "data": None,
+    }
 
-    async def fake_on_message(self: Any, data: Any) -> None:
+    async def fake_on_message(self: FeishuPlusChannel, data: Any) -> None:
         record["calls"] += 1
-        record["flag"] = _TRIGGER_MATCHED.get()
+        record["flag"] = self._trigger.context.matched.get()
+        record["context"] = (
+            self._trigger.context.message_id.get(),
+            self._trigger.context.context.get()
+        )
         record["data"] = data
 
     monkeypatch.setattr(FeishuChannel, "_on_message", fake_on_message)
     return record
 
-
-def test_on_message_auto_thread_injection(
+@pytest.mark.asyncio
+async def test_on_message_auto_thread_injection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     record = _stub_super(monkeypatch)
     ch = _make_channel([("告警", "")], auto_thread=True)
     msg = _text_message("P0 告警")
 
-    import asyncio
-
-    asyncio.run(ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg))))
+    await ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg)))
 
     assert record["calls"] == 1
     # 注入 thread_id = message_id：父类话题管道随之生效。
     assert msg.thread_id == _MSG_ID
     # ContextVar 在父类调用内可见，调用后复位。
     assert record["flag"] is True
-    assert _TRIGGER_MATCHED.get() is False
+    assert ch._trigger.context.matched.get() is False
     # 纯触发规则：content 不改写。
     assert json.loads(msg.content) == {"text": "P0 告警"}
 
-
-def test_on_message_existing_thread_not_overwritten(
+@pytest.mark.asyncio
+async def test_on_message_existing_thread_not_overwritten(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     record = _stub_super(monkeypatch)
     ch = _make_channel([("告警", "")], auto_thread=True)
     msg = _text_message("告警", thread_id="om_existing_thread")
 
-    import asyncio
-
-    asyncio.run(ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg))))
+    await ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg)))
 
     assert msg.thread_id == "om_existing_thread"
 
 
-def test_on_message_auto_thread_disabled(
+@pytest.mark.asyncio
+async def test_on_message_auto_thread_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     record = _stub_super(monkeypatch)
     ch = _make_channel([("告警", "")], auto_thread=False)
     msg = _text_message("告警")
 
-    import asyncio
-
-    asyncio.run(ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg))))
+    await ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg)))
 
     assert msg.thread_id == ""
     assert record["calls"] == 1
 
-
-def test_on_message_context_appended_to_text(
+@pytest.mark.asyncio
+async def test_on_message_context_appended_to_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_super(monkeypatch)
     ch = _make_channel([("告警", "（运维告警场景，请按值班口径回复）")])
     msg = _text_message("P1 告警")
 
-    import asyncio
-
-    asyncio.run(ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg))))
+    await ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg)))
 
     # context 作为一行追加到 text 末尾，仍是合法的飞书 text content。
     payload = json.loads(msg.content)
     assert payload["text"] == "P1 告警\n（运维告警场景，请按值班口径回复）"
 
-
-def test_on_message_no_match_untouched(
+@pytest.mark.asyncio
+async def test_on_message_no_match_untouched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     record = _stub_super(monkeypatch)
     ch = _make_channel([("告警", "ctx")], auto_thread=True)
     msg = _text_message("今天天气不错")
 
-    import asyncio
-
-    asyncio.run(ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg))))
+    await ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg)))
 
     assert msg.thread_id == ""
     assert json.loads(msg.content) == {"text": "今天天气不错"}
     # 未命中不置 ContextVar。
     assert record["flag"] is False
 
-
-def test_on_message_chat_ids_gate_prevents_injection(
+@pytest.mark.asyncio
+async def test_on_message_chat_ids_gate_prevents_injection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # 规则限定 _CHAT_ID；消息来自其他群 —— 正文虽命中但整体不触发：
@@ -550,11 +676,124 @@ def test_on_message_chat_ids_gate_prevents_injection(
     ch = _make_channel([("告警", "ctx", (_CHAT_ID,))], auto_thread=True)
     msg = _text_message("告警", chat_id="oc_other")
 
-    import asyncio
-
-    asyncio.run(ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg))))
+    await ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg)))
 
     assert record["calls"] == 1
     assert msg.thread_id == ""
     assert json.loads(msg.content) == {"text": "告警"}
     assert record["flag"] is False
+
+
+# ====================================================================
+# _on_message wrapper —— interactive 卡片（context 经 ContextVar）
+# ====================================================================
+
+@pytest.mark.asyncio
+async def test_on_message_interactive_context_via_contextvar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 卡片无 text 字段可改写：content 保持原样，context 经
+    # _trigger.context 在父类调用内可见，调用后复位；thread_id 注入
+    # 与消息类型无关。
+    record = _stub_super(monkeypatch)
+    ch = _make_channel([("P0", "（值班告警场景）")], auto_thread=True)
+    msg = _card_message(_alert_card())
+
+    await ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg)))
+
+    assert record["calls"] == 1
+    assert msg.thread_id == _MSG_ID
+    assert json.loads(msg.content) == _alert_card()
+    assert record["context"] == (_MSG_ID, "（值班告警场景）")
+    assert record["flag"] is True
+    assert ch._trigger.context.message_id.get() == ""
+    assert ch._trigger.context.context.get() == ""
+
+@pytest.mark.asyncio
+async def test_on_message_interactive_no_context_not_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 纯触发规则（无 context）：_trigger.context 保持默认空值。
+    record = _stub_super(monkeypatch)
+    ch = _make_channel([("P0", "")])
+    msg = _card_message(_alert_card())
+
+    await ch._on_message(SimpleNamespace(event=SimpleNamespace(message=msg)))
+
+    assert record["calls"] == 1
+    assert record["context"] == ("", "")
+
+
+# ====================================================================
+# _parse_message_content —— 触发 context 在卡片 Markdown 末尾追加
+# ====================================================================
+
+
+def _stub_at_resolver(ch: FeishuPlusChannel) -> None:
+    """_get_user_name_by_open_id 打桩（__new__ 实例无 client，避免触网）。"""
+    async def fake_name(open_id: str) -> Any:
+        return None
+
+    ch._get_user_name_by_open_id = fake_name  # type: ignore[method-assign]
+
+
+async def test_parse_interactive_appends_trigger_context() -> None:
+    ch = _make_channel([])
+    _stub_at_resolver(ch)
+
+    mtk = ch._trigger.context.message_id.set(_MSG_ID)
+    ctk = ch._trigger.context.context.set('（值班告警场景）')
+    try:
+        main_text, error_hints, content_parts = (
+            await ch._parse_message_content(
+                "interactive",
+                json.dumps(_alert_card(), ensure_ascii=False),
+                _MSG_ID,
+            )
+        )
+    finally:
+        ch._trigger.context.message_id.reset(mtk)
+        ch._trigger.context.context.reset(ctk)
+
+    assert main_text is not None
+    assert main_text.startswith("# 告警标题")
+    # context 作为一行追加到渲染 Markdown 末尾。
+    assert main_text.endswith("\n（值班告警场景）")
+    assert error_hints == []
+    assert content_parts == []
+
+
+async def test_parse_interactive_context_skips_quoted_path() -> None:
+    # message_id 不匹配（quoted 路径传 parent_id）→ 不追加 context。
+    ch = _make_channel([])
+    _stub_at_resolver(ch)
+
+    mtk = ch._trigger.context.message_id.set(_MSG_ID)
+    ctk = ch._trigger.context.context.set('ctx')
+    try:
+        main_text, _, _ = await ch._parse_message_content(
+            "interactive",
+            json.dumps(_alert_card(), ensure_ascii=False),
+            "om_other_parent",
+        )
+    finally:
+        ch._trigger.context.message_id.reset(mtk)
+        ch._trigger.context.context.reset(ctk)
+
+    assert main_text is not None
+    assert "ctx" not in main_text
+
+
+async def test_parse_interactive_no_context_untouched() -> None:
+    # 未置位（默认空值）→ 渲染结果原样返回。
+    ch = _make_channel([])
+    _stub_at_resolver(ch)
+
+    main_text, _, _ = await ch._parse_message_content(
+        "interactive",
+        json.dumps(_alert_card(), ensure_ascii=False),
+        _MSG_ID,
+    )
+
+    assert main_text is not None
+    assert main_text == "# 告警标题\n\nP0 CPU 告警"

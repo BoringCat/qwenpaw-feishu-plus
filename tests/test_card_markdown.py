@@ -12,7 +12,9 @@ from typing import Dict, Optional
 
 import pytest
 
-from qwenpaw_feishu_plus.card.markdown import interactive_card_to_markdown
+from qwenpaw_feishu_plus.card.markdown import (
+    interactive_card_to_markdown
+)
 
 TEST_DATA = Path(__file__).parent / "test_data"
 
@@ -319,7 +321,7 @@ async def test_inline_img_and_text_tag() -> None:
 @pytest.mark.asyncio
 async def test_div_without_text_skipped() -> None:
     card = {"elements": [{"tag": "div"}]}
-    assert await interactive_card_to_markdown(_dump(card)) is None
+    assert (await interactive_card_to_markdown(_dump(card))) is None
 
 
 @pytest.mark.asyncio
@@ -327,7 +329,7 @@ async def test_empty_table_skipped() -> None:
     card = {
         "elements": [{"tag": "table", "columns": [{"name": "c1"}]}],
     }
-    assert await interactive_card_to_markdown(_dump(card)) is None
+    assert (await interactive_card_to_markdown(_dump(card))) is None
 
 
 @pytest.mark.parametrize(
@@ -336,4 +338,4 @@ async def test_empty_table_skipped() -> None:
 )
 @pytest.mark.asyncio
 async def test_invalid_content_returns_none(bad) -> None:
-    assert await interactive_card_to_markdown(bad) is None
+    assert (await interactive_card_to_markdown(bad)) is None

@@ -8,11 +8,13 @@
 """
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
 from qwenpaw_feishu_plus.channel import FeishuPlusChannel
+from qwenpaw_feishu_plus.trigger import TriggerContext
 from qwenpaw_feishu_plus.card.markdown import quote_block
 
 TEST_DATA = Path(__file__).parent / "test_data"
@@ -26,6 +28,7 @@ def _make_channel(
 ) -> Tuple[FeishuPlusChannel, Dict[str, int]]:
     """构造跳过 __init__ 的实例；fetch 计数便于断言 slash 跳过。"""
     ch = FeishuPlusChannel.__new__(FeishuPlusChannel)
+    ch._trigger = SimpleNamespace(context=TriggerContext())
     calls = {"fetch": 0}
 
     async def fake_fetch(parent_id: str) -> Optional[Tuple[str, str]]:

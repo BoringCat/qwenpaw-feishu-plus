@@ -190,39 +190,19 @@ def _render_elements(elements: list[_t.Any], at_names: AtNames) -> list[str]:
 # ====================================================================
 
 
-async def interactive_card_to_markdown(
-    content: str|None,
-    at_resolver: AtResolver|None = None,
-) -> str|None:
-    """interactive 卡片 content JSON → Markdown 文本。
-
-    Returns:
-        渲染后的 Markdown（块间空行分隔）；content 非法或渲染为空时
-        返回 None，调用方回退父类单行压平逻辑。
-    """
+def _load_card_json(content: str|None) -> dict[str, _t.Any]|None:
+    """卡片 content JSON → dict；空 / 非法 / 非 dict 返回 None。"""
     if not content:
         return None
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
         return None
-    if not isinstance(data, dict):
-        return None
+    return data if isinstance(data, dict) else None
 
-    # 预解析卡片内全部 <at> 的 open_id（resolver 失败记 None，
-    # 清洗时回退 @id后4位）。
-    at_names: AtNames = {}
-    for open_id in _AT_ID_RE.findall(content):
-        if open_id in at_names:
-            continue
-        name: str|None = None
-        if at_resolver is not None:
-            try:
-                name = await at_resolver(open_id)
-            except Exception:  # noqa: BLE001 - resolver 异常不阻断渲染
-                name = None
-        at_names[open_id] = name if isinstance(name, str) else None
 
+def _render_card(data: dict[str, _t.Any], at_names: AtNames) -> str|None:
+    """渲染卡片 dict 为 Markdown（标题 + 元素树），无内容返回 None。"""
     blocks: list[str] = []
 
     # 标题：v2 header.title 优先，v1 卡片顶层 title 兜底。
@@ -248,3 +228,34 @@ async def interactive_card_to_markdown(
 
     cleaned = [b.strip() for b in blocks if b and b.strip()]
     return "\n\n".join(cleaned) if cleaned else None
+
+
+async def interactive_card_to_markdown(
+    content: str|None,
+    at_resolver: AtResolver|None = None,
+) -> str|None:
+    """interactive 卡片 content JSON → Markdown 文本。
+
+    Returns:
+        渲染后的 Markdown（块间空行分隔）；content 非法或渲染为空时
+        返回 None，调用方回退父类单行压平逻辑。
+    """
+    data = _load_card_json(content)
+    if data is None:
+        return None
+
+    # 预解析卡片内全部 <at> 的 open_id（resolver 失败记 None，
+    # 清洗时回退 @id后4位）。
+    at_names: AtNames = {}
+    for open_id in _AT_ID_RE.findall(content):
+        if open_id in at_names:
+            continue
+        name: str|None = None
+        if at_resolver is not None:
+            try:
+                name = await at_resolver(open_id)
+            except Exception:  # noqa: BLE001 - resolver 异常不阻断渲染
+                name = None
+        at_names[open_id] = name if isinstance(name, str) else None
+
+    return _render_card(data, at_names)

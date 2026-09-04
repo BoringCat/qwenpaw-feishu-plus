@@ -11,7 +11,6 @@
 '''
 
 from .channel import FeishuPlusChannel
-from types import SimpleNamespace
 from agentscope.message import Msg, TextBlock
 from qwenpaw.runtime.hooks import HookContext
 from qwenpaw.app.workspace.workspace import Workspace

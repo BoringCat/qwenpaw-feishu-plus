@@ -20,7 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from qwenpaw_feishu_plus.channel import FeishuPlusChannel, Trigger
-from qwenpaw_feishu_plus.models import CompiledTrigger
+from qwenpaw_feishu_plus.trigger import CompiledTrigger
 
 from qwenpaw_feishu_plus.slash_command import (
     _TRIGGER_COMMAND_USAGE,

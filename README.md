@@ -6,7 +6,7 @@ QwenPaw 飞书渠道增强插件（channel plugin）。继承内置 `FeishuChann
 - **话题内流式输出** —— CardKit 流式卡片在话题内创建与更新，失败自动回退纯文本；以 `/` 开头的命令消息不创建流式卡片，回复保持纯文本；
 - **命令消息跳过引用获取** —— 以 `/` 开头的消息不抓取被回复卡片的内容，避免 `[quoted interactive: ...]` 前缀导致命令匹配失效；
 - **interactive 卡片 Markdown 渲染** —— 收到（含被回复引用）的 interactive 卡片渲染为结构化 Markdown（标题、正文、表格、@人名），修复内置实现丢失 `div` 正文、压成单行的问题；
-- **正则触发规则** —— YAML 文件配置正则列表，群消息正文命中即免 @提及 触发回复，规则可携带场景上下文追加到正文末尾，也可指定群 chat_id 白名单限定生效群；
+- **正则触发规则** —— YAML 文件配置正则列表，群聊 text 消息与 interactive 卡片（渲染 Markdown 后匹配）命中即免 @提及 触发回复，规则可携带场景上下文追加到正文末尾，也可指定群 chat_id 白名单限定生效群；
 - **触发自动进话题** —— 正则触发且消息不在话题中时，机器人回复自动进入以该消息为根的话题；
 - **触发规则管理命令** —— `/feishu-plus show-triggers` 查看生效规则、`/feishu-plus reload-triggers` 重新加载规则 YAML（加载失败保留上一份生效规则），经 `SlashCommandRegistry` 分派并定位当前渠道实例。
 
@@ -65,8 +65,9 @@ triggers:
   - pattern: "^小助手"                # 纯触发，不加上下文
 ```
 
-- 群聊 **text** 消息正文命中任一 `pattern` 即触发回复，无需 @提及（`require_mention` 开启时同样生效；`require_mention` 关闭时所有消息本就触发，正则仍用于匹配 `context` 与自动进话题）；
-- 命中的规则取列表中**第一条**匹配项；`context` 作为一行追加到发给 AI 的消息正文末尾（与用户 @触发 时正文直接可见一致，正文原样保留、不剥离关键词）；规则带 `chat_ids` 时仅当消息所在群在其中才参与匹配，正文命中但群不符会跳过该规则继续找下一条；
+- 群聊 **text** 消息正文与 **interactive 卡片**（渲染为 Markdown，与发给 AI 的正文同源）命中任一 `pattern` 即触发回复，无需 @提及（`require_mention` 开启时同样生效；`require_mention` 关闭时所有消息本就触发，正则仍用于匹配 `context` 与自动进话题）；其余类型（富文本 post、图片等）不参与匹配；
+- 卡片正则针对渲染后的 Markdown 书写：标题渲染为 `# 标题`、`div`/`markdown` 正文原样保留、表格为 GFM、`note` 为 `> ` 引用块 —— `^` 等锚定正则按渲染文本判断（如锚定卡片标题需写 `^#`）；
+- 命中的规则取列表中**第一条**匹配项；`context` 作为一行追加到发给 AI 的消息正文末尾（text 消息改写 `content` 的 text 字段，卡片消息在渲染 Markdown 末尾追加；与用户 @触发 时正文直接可见一致，正文原样保留、不剥离关键词）；规则带 `chat_ids` 时仅当消息所在群在其中才参与匹配，正文命中但群不符会跳过该规则继续找下一条；
 - 无效正则条目跳过并记日志，不影响其余条目；文件格式由 pydantic 模型校验（`triggers` 为列表、`pattern` 必填非空字符串、`context` 可选字符串、`chat_ids` 可选字符串列表且条目非空，多余字段 / 类型错误整份置空并记日志）；文件缺失 / 解析失败 / 结构不符只置空规则，不阻断渠道启动；
 - 「触发自动进话题」开启时，命中消息若不在话题中，机器人回复经 `reply_in_thread` 进入以该消息为根的话题，话题内后续消息按 `thread_id` 共享同一会话上下文；@提及 触发的消息保持普通回复、不自动建话题。
 
@@ -102,7 +103,7 @@ src/
 - **命令跳过引用**：父类会把被回复的 interactive 卡片正文前置成 `[quoted interactive: ...]`，使命令文本不再以 `/` 开头、前缀匹配失效；跳过获取意味着不发 Get Message 请求，引用内容对命令场景本就无意义。
 - **命令消息不流式**：以 `/` 开头的命令消息在 `_before_consume_process` 预创建流式卡片时即被判定（`request` 正文首段以 `/` 开头），跳过预创建并把标志写到 request；`on_streaming_start` 读到标志直接返回、不建卡片，结果经父类 `on_streaming_end` 的纯文本回退发出。会话根与话题内两条路径均生效。
 - **卡片 Markdown 渲染**：内置 `extract_interactive_text` 把卡片压成单行，且 CardKit v2 卡片 `div` 的正文在 `text.content` 键（不在其递归的 child keys 里）会整体丢失。插件改用自研渲染器（`card/markdown.py`）：标题 → `# 标题`、`div`/`markdown` 正文保留（`<text_tag>` 去壳、`<at id=..>` → @名字、`<img>` → [图片]，emoji 短代码保留原样）、原生 `table` → GFM 表格、`note` → `> ` 引用块、`hr`/`button` 忽略。v1 卡片（顶层 `elements` + `markdown` tag）与 v2 / CardKit（`body.elements`）均支持。被引用（回复）卡片以 `> ` Markdown 引用块前置到消息文本，直接收到的卡片消息同样渲染完整 Markdown；渲染失败自动回退父类行为。`@` 名字解析复用 `_get_user_name_by_open_id`（带缓存），应用无 contact 权限或解析失败时回退 `@open_id后4位`。
-- **正则触发规则**：`_on_message` wrapper 在父类处理前完成匹配 —— 命中时改写事件数据（`context` 追加到 `content` 的 text 末尾、必要时注入 `thread_id = message_id`），并以 `ContextVar` 传递命中状态给 `_check_group_mention` 覆写以绕过 @提及 检查。规则带 `chat_ids` 时按消息 `chat_id` 白名单过滤：群不符的规则跳过、不参与命中。父类流程对改写无感知：引用块仍前置正文、slash 命令前缀判断不受末尾追加影响。自动进话题复用父类话题管道（session 按 thread 聚合、`_reply_in_thread` 回复、流式卡片进话题），飞书话题根消息的 `thread_id` 即其自身 `message_id`，后续话题内消息携带相同值，会话天然连续。
+- **正则触发规则**：`_on_message` wrapper 在父类处理前完成匹配 —— 命中时改写事件数据（`context` 追加到 `content` 的 text 末尾、必要时注入 `thread_id = message_id`），并以 `ContextVar` 传递命中状态给 `_check_group_mention` 覆写以绕过 @提及 检查。规则带 `chat_ids` 时按消息 `chat_id` 白名单过滤：群不符的规则跳过、不参与命中。父类流程对改写无感知：引用块仍前置正文、slash 命令前缀判断不受末尾追加影响。interactive 卡片经 `interactive_card_to_markdown_sync`（`card/markdown.py` 渲染核心的同步版，不解析 @名字）渲染成 Markdown 后匹配 —— 与发给 AI 的正文同源；卡片无 text 字段可改写，`context` 经 `_TRIGGER_CONTEXT` ContextVar 传递，由 `_parse_message_content` 覆写在渲染 Markdown 末尾追加，`message_id` 匹配确保 quoted 路径（传 parent_id）不会误追加。自动进话题复用父类话题管道（session 按 thread 聚合、`_reply_in_thread` 回复、流式卡片进话题），飞书话题根消息的 `thread_id` 即其自身 `message_id`，后续话题内消息携带相同值，会话天然连续。
 
 ## 已知限制
 
